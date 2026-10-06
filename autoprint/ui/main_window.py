@@ -6,14 +6,14 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect, Qt, QTimer
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QRect, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QProgressBar, QPushButton, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
-from .. import APP_NAME, __version__
+from .. import APP_NAME, __version__, taskbar
 from ..comments import strip_comments
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
@@ -329,8 +329,12 @@ class MainWindow(QMainWindow):
                               f"{s.hotkey_stop or '—'} — стоп")
         on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
         if on_top != s.always_on_top:
-            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, s.always_on_top)
-            self.show()
+            visible = self.isVisible()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, s.always_on_top)  # пересоздаёт окно
+            # свойства панели задач — до показа, иначе кнопка успеет появиться как «Python»
+            self._apply_taskbar()
+            if visible:
+                self.show()
         self.engine.rebuild()
         self._on_state(self.engine.state)
 
@@ -699,19 +703,17 @@ class MainWindow(QMainWindow):
             return None
         v, block = a
         text, base = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
-        # srcmap: символ печатаемого текста → позиция в блоке (для подсветки напечатанного)
-        srcmap = None
         if self.settings.strip_comments:
-            text, srcmap = strip_comments(text, block.lang)
+            text, _ = strip_comments(text, block.lang)
         if not text.strip():
             return None
-        return {"tid": v.template.id, "bid": block.id, "base": base, "text": text, "srcmap": srcmap}
+        return {"tid": v.template.id, "bid": block.id, "base": base, "text": text}
 
     def _same_job(self, job: dict | None) -> bool:
         return bool(job and self.job and all(job[k] == self.job[k] for k in ("tid", "bid", "base", "text")))
 
     def _load_job(self, job: dict) -> None:
-        self._clear_typed()
+        self._reset_progress()
         self.job = job
         self.engine.load(job["text"], job["bid"])
 
@@ -755,7 +757,7 @@ class MainWindow(QMainWindow):
 
     def cmd_stop(self) -> None:
         self.engine.stop()
-        self._clear_typed()
+        self._reset_progress()
         self.job = None
 
     def cmd_block(self, d: int) -> None:
@@ -802,7 +804,9 @@ class MainWindow(QMainWindow):
     def _on_guard(self, kind: str) -> None:
         if self.engine.state == RUNNING:
             self.engine.pause("нажата клавиша" if kind == "key" else "клик мышью")
-            self._notify("Пауза: вы нажали клавишу" if kind == "key" else "Пауза: вы кликнули мышью", tray=True)
+            # без всплывающего уведомления Windows: оно со звуком, а пауза и так видна (оранжевый значок)
+            self.statusBar().showMessage("Пауза: вы нажали клавишу" if kind == "key"
+                                         else "Пауза: вы кликнули мышью", 7000)
 
     def _on_state(self, st: str) -> None:
         if st == RUNNING and self.settings.guard_enabled:
@@ -822,19 +826,8 @@ class MainWindow(QMainWindow):
     def _on_progress(self, pos: int, total: int) -> None:
         self.progress.setMaximum(max(1, total))
         self.progress.setValue(pos)
-        if self.job:
-            v = self.view_for(self.job["tid"])
-            if v:
-                base, srcmap = self.job["base"], self.job.get("srcmap")
-                if srcmap is not None and pos:
-                    pos = srcmap[min(pos, len(srcmap)) - 1] + 1
-                v.set_typed(self.job["bid"], base, base + pos)
 
-    def _clear_typed(self) -> None:
-        if self.job:
-            v = self.view_for(self.job["tid"])
-            if v:
-                v.set_typed("", 0, 0)
+    def _reset_progress(self) -> None:
         self.progress.setValue(0)
 
     def _on_countdown(self, n: int) -> None:
@@ -878,6 +871,24 @@ class MainWindow(QMainWindow):
 <p>Профиль <b>IDE</b> убирает автоотступы и автозакрытые скобки редактора.
 Для Блокнота выберите профиль <b>Блокнот</b>.</p>
 <p>Если окно сменилось во время печати — набор встанет на паузу.</p>""")
+
+    # ================================================================ панель задач
+    def set_taskbar_icon(self, icon_path: str) -> None:
+        """Своя иконка и имя на панели задач (иначе Windows покажет «Python»)."""
+        self._taskbar_icon = icon_path
+        self._apply_taskbar()
+
+    def _apply_taskbar(self) -> None:
+        path = getattr(self, "_taskbar_icon", "")
+        if path:
+            taskbar.apply_to_window(int(self.winId()), path, APP_NAME)
+
+    def event(self, e) -> bool:
+        # «Окно поверх остальных» и т. п. пересоздают окно Windows — свойства панели задач
+        # теряются, их нужно записать новому окну
+        if e.type() == QEvent.Type.WinIdChange:
+            QTimer.singleShot(0, self._apply_taskbar)
+        return super().event(e)
 
     def closeEvent(self, e) -> None:
         self.engine.stop()

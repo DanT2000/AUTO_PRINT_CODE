@@ -1,11 +1,11 @@
-"""Редактор кода образца: номера строк, тёмная тема, подсветка уже напечатанной части."""
+"""Редактор кода образца: номера строк, тёмная тема, подсветка синтаксиса."""
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QTextCursor, QTextFormat
 from PySide6.QtWidgets import QPlainTextEdit, QTextEdit, QWidget
 
-from ..highlighter import (EDITOR_BG, EDITOR_FG, EDITOR_GUTTER, EDITOR_LINE, EDITOR_SEL, EDITOR_TYPED,
+from ..highlighter import (EDITOR_BG, EDITOR_FG, EDITOR_GUTTER, EDITOR_LINE, EDITOR_SEL,
                            CodeHighlighter)
 
 
@@ -52,7 +52,6 @@ class CodeEditor(QPlainTextEdit):
         self.setPlainText(text)
         self.highlighter = CodeHighlighter(self.document(), lang)
         self._gutter = _Gutter(self)
-        self._typed: tuple[int, int] | None = None
         self.blockCountChanged.connect(self._update_gutter_width)
         self.updateRequest.connect(self._update_gutter)
         self.cursorPositionChanged.connect(self._refresh_extra)
@@ -119,32 +118,9 @@ class CodeEditor(QPlainTextEdit):
         b = doc.findBlock(c.selectionEnd()).blockNumber()
         return a, b
 
-    # ---- подсветка текущей строки и напечатанного
-    def set_typed(self, start: int, end: int) -> None:
-        self._typed = (start, end) if end > start else None
-        self._refresh_extra()
-        if self._typed:
-            c = QTextCursor(self.document())
-            c.setPosition(min(end, len(self.toPlainText())))
-            rect = self.cursorRect(c)  # прокрутить к месту печати, не трогая выделение пользователя
-            if not self.viewport().rect().contains(rect.center()):
-                self.verticalScrollBar().setValue(self.verticalScrollBar().value() + rect.center().y()
-                                                  - self.viewport().height() // 2)
-
-    def clear_typed(self) -> None:
-        self.set_typed(0, 0)
-
+    # ---- подсветка текущей строки
     def _refresh_extra(self) -> None:
         extras = []
-        if self._typed:
-            s = QTextEdit.ExtraSelection()
-            s.format.setBackground(QColor(EDITOR_TYPED))
-            c = QTextCursor(self.document())
-            n = len(self.toPlainText())
-            c.setPosition(min(self._typed[0], n))
-            c.setPosition(min(self._typed[1], n), QTextCursor.MoveMode.KeepAnchor)
-            s.cursor = c
-            extras.append(s)
         if self.hasFocus() and not self.textCursor().hasSelection():
             s = QTextEdit.ExtraSelection()
             s.format.setBackground(QColor(EDITOR_LINE))

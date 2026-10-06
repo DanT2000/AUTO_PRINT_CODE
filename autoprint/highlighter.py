@@ -17,7 +17,6 @@ LANGUAGES = ["python", "javascript", "typescript", "html", "css", "sql", "java",
 EDITOR_BG = "#1e2229"
 EDITOR_FG = "#d7dae0"
 EDITOR_LINE = "#2a2f38"
-EDITOR_TYPED = "#23402f"
 EDITOR_SEL = "#264f78"
 EDITOR_GUTTER = "#5c6370"
 

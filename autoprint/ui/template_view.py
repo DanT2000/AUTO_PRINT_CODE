@@ -44,7 +44,6 @@ class TemplateView(QWidget):
         super().__init__()
         self.template = template
         self.widgets: list[BlockWidget] = []
-        self._typed: tuple[str, int, int] | None = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -90,7 +89,6 @@ class TemplateView(QWidget):
         if codes and not any(w.block.id == self.template.active_block for w in codes):
             self.arm(codes[0].block.id)
         self._apply_armed()
-        self._apply_typed()
         if keep_scroll:
             QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(scroll_pos))
         else:
@@ -203,7 +201,10 @@ class TemplateView(QWidget):
     def _apply_armed(self) -> None:
         for w in self.widgets:
             if isinstance(w, CodeBlockWidget):
-                w.set_armed(w.block.id == self.template.active_block)
+                on = w.block.id == self.template.active_block
+                w.set_armed(on)
+                if not on and w.block.sel:
+                    w.clear_selection()   # выделение — только у активного блока
 
     def code_widget(self, block_id: str) -> CodeBlockWidget | None:
         return next((w for w in self.widgets if isinstance(w, CodeBlockWidget) and w.block.id == block_id), None)
@@ -215,15 +216,3 @@ class TemplateView(QWidget):
         w = self.code_widget(block_id)
         if w:
             QTimer.singleShot(30, w, lambda: self.scroll.ensureWidgetVisible(w, 0, 40))
-
-    def set_typed(self, block_id: str, start: int, end: int) -> None:
-        self._typed = (block_id, start, end) if block_id else None
-        self._apply_typed()
-
-    def _apply_typed(self) -> None:
-        for w in self.widgets:
-            if isinstance(w, CodeBlockWidget):
-                if self._typed and self._typed[0] == w.block.id:
-                    w.editor.set_typed(self._typed[1], self._typed[2])
-                else:
-                    w.editor.clear_typed()

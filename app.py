@@ -52,7 +52,7 @@ def main() -> int:
     app.setWindowIcon(win.windowIcon())   # и для диалогов
     icon_file = DATA_DIR / "autoprintcode.ico"
     if save_ico(STATE_COLORS[IDLE], icon_file):
-        taskbar.apply_to_window(int(win.winId()), str(icon_file), APP_NAME)
+        win.set_taskbar_icon(str(icon_file))
     win.show()
     code = app.exec()
     lock.unlock()
