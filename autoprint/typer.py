@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from PySide6.QtCore import QObject, Signal
 
 from . import winapi as w
+from .human import humanize
 from .storage import PROFILE_IDE, Settings
 
 # Минимальный интервал между нажатиями задаётся настройкой key_gap_ms.
@@ -38,9 +39,11 @@ IDLE, COUNTDOWN, RUNNING, PAUSED, FINISHED = "idle", "countdown", "running", "pa
 
 @dataclass
 class Unit:
-    kind: str            # char | fast | newline | cleanup
+    kind: str            # char | fast | tab | back | newline | cleanup
     text: str = ""
     src_end: int = 0     # позиция в исходном тексте после этой единицы
+    k: float = 1.0       # множитель задержки после единицы (имитация ручного ввода)
+    pause: float = 0.0   # пауза перед единицей, с (обдумывание)
 
 
 def build_units(text: str, settings: Settings) -> list[Unit]:
@@ -52,7 +55,19 @@ def build_units(text: str, settings: Settings) -> list[Unit]:
             src += 1
             units.append(Unit("newline", "\n", src))
         m = len(line) - len(line.lstrip(" \t"))
-        if m:
+        if m and settings.indent_with_tab:
+            # как человек: Tab на каждый уровень отступа, остаток — пробелами
+            col, cols = 0, []      # cols[i] — ширина отступа после i+1 исходных символов
+            for ch in line[:m]:
+                col += len(tab) if ch == "\t" else 1
+                cols.append(col)
+            done = 0               # сколько исходных символов отступа уже набрано
+            for level in range(1, col // len(tab) + 1):
+                done = next(i for i, c in enumerate(cols) if c >= level * len(tab)) + 1
+                units.append(Unit("tab", "\t", src + done))
+            for i in range(col % len(tab)):
+                units.append(Unit("char", " ", src + min(m, done + i + 1)))
+        elif m:
             indent = line[:m].replace("\t", tab)
             if settings.fast_indent:
                 units.append(Unit("fast", indent, src + m))
@@ -62,6 +77,8 @@ def build_units(text: str, settings: Settings) -> list[Unit]:
         for i, ch in enumerate(line[m:], start=m):
             units.append(Unit("char", tab if ch == "\t" else ch, src + i + 1))
         src += len(line)
+    if settings.human_typing:
+        units = humanize(units, settings)
     if settings.profile == PROFILE_IDE and units:
         units.append(Unit("cleanup", "", src))
     return units
@@ -198,6 +215,18 @@ class TypingEngine(QObject):
                 return True
             time.sleep(min(left, 0.05))
 
+    def _think(self, gen: int, seconds: float) -> bool:
+        """Пауза-обдумывание: обрывается, если поставили на паузу. False — если печать отменена."""
+        end = time.perf_counter() + seconds
+        while self._run.is_set():
+            if not self._alive(gen):
+                return False
+            left = end - time.perf_counter()
+            if left <= 0:
+                break
+            time.sleep(min(left, 0.05))
+        return self._alive(gen)
+
     def _prepare(self, gen: int, delay: float, countdown: int) -> int | None:
         """Отсчёт, ожидание отпускания модификаторов, захват целевого окна."""
         if countdown > 0:
@@ -238,6 +267,7 @@ class TypingEngine(QObject):
             return
         self._set_state(RUNNING)
         total = len(self._text)
+        thought = -1    # для какой единицы пауза-обдумывание уже выдержана
         while self._alive(gen) and self._pos < len(self._units):
             if not self._run.is_set():
                 self._run.wait()
@@ -250,6 +280,13 @@ class TypingEngine(QObject):
                         self._set_state(PAUSED)
                     continue
                 self._set_state(RUNNING)
+            unit = self._units[self._pos]
+            if unit.pause and thought != self._pos:
+                # обдумывание: прерывается паузой и остановкой; после него заново проверяем окно
+                if not self._think(gen, unit.pause):
+                    return
+                thought = self._pos
+                continue
             if self.settings.autopause_on_focus_change and w.foreground_window() != target:
                 self._run.clear()
                 self._set_state(PAUSED)
@@ -257,7 +294,6 @@ class TypingEngine(QObject):
                          self._pos, len(self._units))
                 self.message.emit("Пауза: сменилось активное окно. Вернитесь в нужное окно и продолжите.")
                 continue
-            unit = self._units[self._pos]
             try:
                 self._execute(unit)
             except OSError as e:
@@ -288,6 +324,12 @@ class TypingEngine(QObject):
         elif u.kind == "fast":
             self.sound.emit("space")
             self._fast(u.text)
+        elif u.kind == "tab":
+            w.tap(w.VK_TAB)
+            self.sound.emit("key")
+        elif u.kind == "back":
+            w.tap(w.VK_BACK)
+            self.sound.emit("key")
         elif u.kind == "newline":
             if ide:
                 self._clear_right()
@@ -327,7 +369,12 @@ class TypingEngine(QObject):
         s = self.settings
         base = 60.0 / max(30, s.cpm)
         j = max(0, min(90, s.jitter)) / 100
-        d = base * random.uniform(1 - j, 1 + j)
+        if s.human_typing:
+            # логнормальный разброс: в основном ровно, изредка заметная заминка; среднее = base·k
+            sigma = 0.1 + 0.5 * j
+            d = base * u.k * random.lognormvariate(-sigma * sigma / 2, sigma)
+        else:
+            d = base * random.uniform(1 - j, 1 + j)
         if u.kind == "newline":
             d += s.newline_pause_ms / 1000
         elif u.kind == "char" and u.text in PUNCT:

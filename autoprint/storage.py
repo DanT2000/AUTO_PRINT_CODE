@@ -62,9 +62,14 @@ class Settings:
     newline_pause_ms: int = 220        # доп. пауза после Enter
     punct_pause_ms: int = 50           # доп. пауза после , ; : ) и т.п.
     fast_indent: bool = True           # отступы печатаются быстро
+    indent_with_tab: bool = False      # отступ — нажатиями Tab (по одному на tab_width пробелов)
     key_gap_ms: int = 30               # мин. интервал между нажатиями (надёжность ввода)
     tab_width: int = 4                 # табы в коде заменяются пробелами
     selection_whole_lines: bool = True # выделение в образце расширяется до целых строк
+    strip_comments: bool = False       # не печатать комментарии из кода
+    human_typing: bool = False         # имитация ручного ввода: живой ритм, обдумывание, опечатки
+    typo_per_100_words: int = 3        # опечаток на 100 слов (исправляются Backspace)
+    think_pause_s: float = 1.5         # пауза на обдумывание перед новой строкой (до …, с)
 
     profile: str = PROFILE_IDE
     esc_before_enter: bool = False     # закрывать подсказки Esc перед Enter (не для Jupyter!)

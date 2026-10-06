@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
                                QToolButton, QVBoxLayout, QWidget)
 
 from .. import APP_NAME, __version__
+from ..comments import strip_comments
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
 from ..importers import export_ipynb, import_ipynb, import_markdown, import_python
@@ -242,6 +243,10 @@ class MainWindow(QMainWindow):
         self._act(m, "Следующий блок кода", lambda: self.cmd_block(+1), "Alt+Down")
         self._act(m, "Предыдущий блок кода", lambda: self.cmd_block(-1), "Alt+Up")
         m.addSeparator()
+        self.act_strip = self._act(m, "Без комментариев", self._on_strip_toggle)
+        self.act_strip.setCheckable(True)
+        self.act_human = self._act(m, "Как человек (ритм, паузы, опечатки)", self._on_human_toggle)
+        self.act_human.setCheckable(True)
         self._act(m, "Настройки…", self.open_settings, "Ctrl+,")
         m = self.menuBar().addMenu("Вид")
         self._act(m, "Блок крупнее", lambda: self._zoom_block(+1), "Ctrl+=")
@@ -311,6 +316,8 @@ class MainWindow(QMainWindow):
         self.btn_sound.setChecked(s.sound_enabled)
         self.btn_sound.setText("🔊" if s.sound_enabled else "🔇")
         self.btn_sound.blockSignals(False)
+        self.act_strip.setChecked(s.strip_comments)
+        self.act_human.setChecked(s.human_typing)
         self.player.enabled = s.sound_enabled
         self.player.set_style(s.sound_style)
         self.player.set_volume(s.sound_volume)
@@ -359,6 +366,21 @@ class MainWindow(QMainWindow):
         self.player.set_style(self.settings.sound_style)
         self.player.set_volume(self.settings.sound_volume)
         self._apply_settings()
+
+    def _on_strip_toggle(self, on: bool) -> None:
+        self.settings.strip_comments = on
+        self._save_settings()
+        self._invalidate_job_if_idle()
+        self._update_armed_label()
+        self._notify("Комментарии не печатаются." if on else "Комментарии печатаются как в образце.")
+
+    def _on_human_toggle(self, on: bool) -> None:
+        self.settings.human_typing = on
+        self._save_settings()
+        self.engine.rebuild()
+        self._invalidate_job_if_idle()
+        self._notify("Имитация ручного ввода включена: живой ритм, паузы, опечатки."
+                     if on else "Имитация ручного ввода выключена.")
 
     def _test_sound(self, style: str, volume: int) -> None:
         self.player.set_style(style)
@@ -662,7 +684,11 @@ class MainWindow(QMainWindow):
         v, block = a
         n = [b.id for b in v.template.code_blocks()].index(block.id) + 1
         text, _ = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
+        if self.settings.strip_comments:
+            text, _ = strip_comments(text, block.lang)
         part = "выделенные строки" if block.sel else "весь блок"
+        if self.settings.strip_comments:
+            part += ", без комментариев"
         lines = text.count("\n") + 1 if text else 0
         self.armed_lbl.setText(f"Печатать: <b>{v.template.title}</b> · {block.display_title(n)} · {part} "
                                f"({lines} стр., {len(text)} симв.)")
@@ -673,9 +699,13 @@ class MainWindow(QMainWindow):
             return None
         v, block = a
         text, base = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
+        # srcmap: символ печатаемого текста → позиция в блоке (для подсветки напечатанного)
+        srcmap = None
+        if self.settings.strip_comments:
+            text, srcmap = strip_comments(text, block.lang)
         if not text.strip():
             return None
-        return {"tid": v.template.id, "bid": block.id, "base": base, "text": text}
+        return {"tid": v.template.id, "bid": block.id, "base": base, "text": text, "srcmap": srcmap}
 
     def _same_job(self, job: dict | None) -> bool:
         return bool(job and self.job and all(job[k] == self.job[k] for k in ("tid", "bid", "base", "text")))
@@ -795,7 +825,9 @@ class MainWindow(QMainWindow):
         if self.job:
             v = self.view_for(self.job["tid"])
             if v:
-                base = self.job["base"]
+                base, srcmap = self.job["base"], self.job.get("srcmap")
+                if srcmap is not None and pos:
+                    pos = srcmap[min(pos, len(srcmap)) - 1] + 1
                 v.set_typed(self.job["bid"], base, base + pos)
 
     def _clear_typed(self) -> None:

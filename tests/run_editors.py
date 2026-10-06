@@ -6,6 +6,7 @@
 Браузер (Monaco = Colab, CodeMirror 6 = JupyterLab): страница кладёт текст редактора
 в заголовок окна. Перед браузерным тестом один раз: cd tests/pages && npm i && npm run build.
 VS Code запускается изолированным экземпляром (свой профиль, настройки по умолчанию).
+AP_TAB=1 — отступы набираются клавишей Tab (настройка indent_with_tab).
 Во время прогона НЕ трогать клавиатуру и мышь — тест управляет фокусом.
 """
 import functools
@@ -69,6 +70,7 @@ def run(name, cmd, fname, code, profile, cpm=1500, settle=1.5, close_keys=None):
         print(f"[{name}] окно не получило фокус"); return
     time.sleep(settle)
     s = Settings(); s.profile = profile; s.cpm = cpm; s.jitter = 0; s.newline_pause_ms = 40; s.punct_pause_ms = 0
+    s.indent_with_tab = bool(os.environ.get("AP_TAB"))   # AP_TAB=1 — отступы клавишей Tab
     e = TypingEngine(s); msgs = []
     e.message.connect(msgs.append)
     e.load(code); e.start(0.05)
@@ -144,6 +146,7 @@ def run_browser(name, page, lang, code, cpm=1500):
         print(f"[{name}] редактор не загрузился"); return
     time.sleep(1.5)
     s = Settings(); s.profile = "ide"; s.cpm = cpm; s.jitter = 0; s.newline_pause_ms = 40; s.punct_pause_ms = 0
+    s.indent_with_tab = bool(os.environ.get("AP_TAB"))   # AP_TAB=1 — отступы клавишей Tab
     e = TypingEngine(s); msgs = []
     e.message.connect(msgs.append)
     e.load(code); e.start(0.05)

@@ -5,7 +5,7 @@ from dataclasses import asdict
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QGroupBox,
                                QHBoxLayout, QKeySequenceEdit, QLabel, QMessageBox, QPushButton, QSlider,
                                QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
@@ -89,8 +89,19 @@ class SettingsDialog(QDialog):
                                 "Если символы пропадают — увеличьте.")
         self.fast_indent = QCheckBox("Отступы печатать быстро")
         self.fast_indent.setChecked(s.fast_indent)
+        self.indent_tab = QCheckBox("Отступы набирать клавишей Tab (как программист)")
+        self.indent_tab.setChecked(s.indent_with_tab)
+        self.indent_tab.setToolTip("Одно нажатие Tab на каждые «Таб в образце» пробелов отступа. "
+                                   "Редактор сам превращает Tab в отступ (VS Code, PyCharm, Jupyter — "
+                                   "4 пробела). Не включайте для простых полей ввода в браузере: "
+                                   "там Tab переводит фокус. Если в редакторе отступ 2 пробела — "
+                                   "уровни разойдутся с образцом.")
         self.whole_lines = QCheckBox("Выделение в образце расширять до целых строк")
         self.whole_lines.setChecked(s.selection_whole_lines)
+        self.strip_comments = QCheckBox("Не печатать комментарии (# …, // …, /* … */)")
+        self.strip_comments.setChecked(s.strip_comments)
+        self.strip_comments.setToolTip("Строки-комментарии пропускаются целиком, комментарии в конце строки "
+                                       "отрезаются. Сам образец не меняется.")
         self.profile = QComboBox()
         for k, v in PROFILES.items():
             self.profile.addItem(v, k)
@@ -104,7 +115,9 @@ class SettingsDialog(QDialog):
         f.addRow("Таб в образце =", self.tab_w)
         f.addRow("Мин. интервал нажатий:", self.key_gap)
         f.addRow(self.fast_indent)
+        f.addRow(self.indent_tab)
         f.addRow(self.whole_lines)
+        f.addRow(self.strip_comments)
         f.addRow("Профиль окна:", self.profile)
         f.addRow(self.esc)
         hint = QLabel("<b>IDE</b>: убирает автоотступы и автоскобки редактора, чтобы код "
@@ -113,6 +126,43 @@ class SettingsDialog(QDialog):
         hint.setStyleSheet("color: gray;")
         f.addRow(hint)
         tabs.addTab(w, "Печать")
+
+        # ---- имитация ручного ввода
+        w = QWidget()
+        f = QFormLayout(w)
+        self.human = QCheckBox("Имитация ручного ввода")
+        self.human.setChecked(s.human_typing)
+        self.typos = _spin(0, 30, s.typo_per_100_words, " на 100 слов")
+        self.typos.setToolTip("0 — без опечаток. Опечатки только в словах из букв; "
+                              "скобки, кавычки, отступы и Enter никогда не задеваются.")
+        self.think = QDoubleSpinBox()
+        self.think.setRange(0, 10)
+        self.think.setSingleStep(0.5)
+        self.think.setDecimals(1)
+        self.think.setSuffix(" с")
+        self.think.setValue(s.think_pause_s)
+        self.think.setToolTip("0 — без пауз. Перед новым куском кода (после пустой строки, "
+                              "перед def/class/for/if) пауза дольше.")
+        f.addRow(self.human)
+        f.addRow("Опечатки:", self.typos)
+        f.addRow("Обдумывание строки:", self.think)
+        hint = QLabel(
+            "Как набирает человек:<br>"
+            "• <b>неровный ритм</b> — знакомые слова (print, return, self) быстрой очередью, первая буква "
+            "слова, заглавные и символы с Shift — медленнее, темп плавно «гуляет»;<br>"
+            "• <b>обдумывание</b> — пауза перед новой строкой, дольше перед новым куском кода, "
+            "иногда заминка между словами;<br>"
+            "• <b>опечатки</b> — соседняя клавиша, перестановка букв, двойное нажатие; ошибка "
+            "замечается через 0–2 буквы и исправляется Backspace.<br>"
+            "«Разброс темпа» на вкладке «Печать» задаёт неровность ритма. Из-за пауз набор "
+            "идёт медленнее заданной скорости.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        f.addRow(hint)
+        for wdg in (self.typos, self.think):
+            wdg.setEnabled(s.human_typing)
+            self.human.toggled.connect(wdg.setEnabled)
+        tabs.addTab(w, "Как человек")
 
         # ---- звук
         w = QWidget()
@@ -193,7 +243,12 @@ class SettingsDialog(QDialog):
         s.tab_width = self.tab_w.value()
         s.key_gap_ms = self.key_gap.value()
         s.fast_indent = self.fast_indent.isChecked()
+        s.indent_with_tab = self.indent_tab.isChecked()
         s.selection_whole_lines = self.whole_lines.isChecked()
+        s.strip_comments = self.strip_comments.isChecked()
+        s.human_typing = self.human.isChecked()
+        s.typo_per_100_words = self.typos.value()
+        s.think_pause_s = float(self.think.value())
         s.profile = self.profile.currentData() or PROFILE_IDE
         s.esc_before_enter = self.esc.isChecked()
         s.sound_enabled = self.snd.isChecked()
