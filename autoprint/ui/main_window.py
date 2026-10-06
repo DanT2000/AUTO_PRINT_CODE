@@ -1,11 +1,12 @@
 """Главное окно: библиотека образцов, вкладки, панель управления печатью, трей."""
 from __future__ import annotations
 
+import struct
 import time
 from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, Qt, QTimer
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QRect, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
 from .. import APP_NAME, __version__
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
-from ..importers import export_ipynb, import_ipynb, import_markdown
+from ..importers import export_ipynb, import_ipynb, import_markdown, import_python
 from ..sounds import KeySoundPlayer
 from ..storage import PROFILES, Settings, Template, TemplateStore
 from ..typer import COUNTDOWN, FINISHED, IDLE, PAUSED, RUNNING, TypingEngine
@@ -29,11 +30,16 @@ STATE_TEXT = {IDLE: "Готов", COUNTDOWN: "Отсчёт…", RUNNING: "Печ
               FINISHED: "Готово ✓"}
 
 
-def make_icon(color: str) -> QIcon:
-    pm = QPixmap(64, 64)
+ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+
+
+def make_icon_pixmap(color: str, size: int = 64) -> QPixmap:
+    pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    p.scale(size / 64, size / 64)   # рисуется в координатах 64×64
     p.setBrush(QColor("#1e2229"))
     p.setPen(Qt.PenStyle.NoPen)
     p.drawRoundedRect(2, 2, 60, 60, 12, 12)
@@ -43,9 +49,37 @@ def make_icon(color: str) -> QIcon:
     f = QFont("Consolas", 22)
     f.setBold(True)
     p.setFont(f)
-    p.drawText(pm.rect().adjusted(0, -8, 0, -8), Qt.AlignmentFlag.AlignCenter, "</>")
+    p.drawText(QRect(0, -8, 64, 64), Qt.AlignmentFlag.AlignCenter, "</>")
     p.end()
-    return QIcon(pm)
+    return pm
+
+
+def make_icon(color: str) -> QIcon:
+    icon = QIcon()
+    for s in ICON_SIZES:
+        icon.addPixmap(make_icon_pixmap(color, s))
+    return icon
+
+
+def save_ico(color: str, path: Path) -> bool:
+    """Многоразмерный .ico (PNG внутри) — его Windows показывает на панели задач."""
+    images = []
+    for s in ICON_SIZES:
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        make_icon_pixmap(color, s).save(buf, "PNG")
+        images.append((s, bytes(buf.data())))
+    head = struct.pack("<HHH", 0, 1, len(images))
+    offset = len(head) + 16 * len(images)
+    entries = b""
+    for s, data in images:
+        entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset)
+        offset += len(data)
+    try:
+        path.write_bytes(head + entries + b"".join(d for _s, d in images))
+        return True
+    except OSError:
+        return False
 
 
 class MainWindow(QMainWindow):
@@ -192,7 +226,7 @@ class MainWindow(QMainWindow):
         # ---- меню
         m = self.menuBar().addMenu("Файл")
         self._act(m, "Новый образец", self.new_template, "Ctrl+N")
-        self._act(m, "Импорт (.ipynb, .md, .json)…", self.import_files, "Ctrl+O")
+        self._act(m, "Импорт (.ipynb, .md, .py, .json)…", self.import_files, "Ctrl+O")
         self._act(m, "Экспорт образца в .ipynb…", lambda: self.export_current("ipynb"))
         self._act(m, "Экспорт образца в .json…", lambda: self.export_current("json"))
         m.addSeparator()
@@ -506,7 +540,8 @@ class MainWindow(QMainWindow):
     def import_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Импорт образцов", "",
-            "Тетрадки и образцы (*.ipynb *.md *.json);;Jupyter (*.ipynb);;Markdown (*.md);;JSON (*.json)")
+            "Тетрадки и образцы (*.ipynb *.md *.py *.pyw *.json);;Jupyter (*.ipynb);;Markdown (*.md);;"
+            "Python (*.py *.pyw);;JSON (*.json)")
         last = None
         for p in paths:
             ext = Path(p).suffix.lower()
@@ -515,6 +550,8 @@ class MainWindow(QMainWindow):
                     t = import_ipynb(p)
                 elif ext == ".md":
                     t = import_markdown(p)
+                elif ext in (".py", ".pyw"):
+                    t = import_python(p)
                 else:
                     t = TemplateStore.read_template_file(p)
             except Exception as e:

@@ -1,7 +1,6 @@
 """AutoPrintCode — запуск: python app.py"""
 from __future__ import annotations
 
-import ctypes
 import signal
 import sys
 import threading
@@ -9,7 +8,7 @@ import threading
 from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from autoprint import APP_NAME, __version__
+from autoprint import APP_NAME
 from autoprint.storage import DATA_DIR, Settings, TemplateStore
 
 
@@ -17,8 +16,9 @@ def main() -> int:
     if sys.platform != "win32":
         print("AutoPrintCode работает только в Windows (использует WinAPI SendInput).")
         return 1
+    from autoprint import taskbar
     # своя иконка на панели задач, а не иконка python.exe
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"autoprintcode.{__version__}")
+    taskbar.set_process_app_id()
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -46,8 +46,13 @@ def main() -> int:
         QMessageBox.critical(None, APP_NAME, str(e))
         return 1
 
-    from autoprint.ui.main_window import MainWindow
+    from autoprint.ui.main_window import STATE_COLORS, MainWindow, save_ico
+    from autoprint.typer import IDLE
     win = MainWindow(Settings.load(), store)
+    app.setWindowIcon(win.windowIcon())   # и для диалогов
+    icon_file = DATA_DIR / "autoprintcode.ico"
+    if save_ico(STATE_COLORS[IDLE], icon_file):
+        taskbar.apply_to_window(int(win.winId()), str(icon_file), APP_NAME)
     win.show()
     code = app.exec()
     lock.unlock()

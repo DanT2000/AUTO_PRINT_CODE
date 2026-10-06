@@ -1,4 +1,4 @@
-"""Импорт образцов из Jupyter-тетрадок (.ipynb) и Markdown-файлов (.md).
+"""Импорт образцов из Jupyter-тетрадок (.ipynb), Markdown (.md) и Python-файлов (.py).
 
 Файл забирается целиком, как есть: каждая ячейка — отдельный блок
 в исходном порядке (пустые ячейки пропускаются).
@@ -73,6 +73,38 @@ def import_markdown(path: str) -> Template:
     for b, lang in zip(code_blocks, nonempty_langs):
         b.lang = lang
     return t
+
+
+_PY_CELL = re.compile(r"^#[ \t]*%%(.*)$")
+_PY_MD_TAG = re.compile(r"\[\s*(markdown|md)\s*\]", re.I)
+
+
+def _uncomment(lines: list[str]) -> str:
+    out = []
+    for ln in lines:
+        s = ln.lstrip()
+        out.append(s[2:] if s.startswith("# ") else s[1:] if s.startswith("#") else ln)
+    return "\n".join(out).strip("\n")
+
+
+def import_python(path: str) -> Template:
+    """Python-файл. Есть разметка ячеек «# %%» (VS Code, Spyder, Jupytext) — по ячейке на блок,
+    «# %% [markdown]» — блок-пояснение без «# ». Иначе весь файл — один блок кода, как есть."""
+    text = Path(path).read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    lines = text.split("\n")
+    marks = [i for i, ln in enumerate(lines) if _PY_CELL.match(ln)]
+    if not marks:
+        return _build(Path(path).stem, [("code", text.strip("\n"))], "python")
+    cells: list[tuple] = [("code", "\n".join(lines[:marks[0]]).strip("\n"))]
+    for n, i in enumerate(marks):
+        body = lines[i + 1:marks[n + 1] if n + 1 < len(marks) else len(lines)]
+        header = _PY_CELL.match(lines[i]).group(1)
+        if _PY_MD_TAG.search(header):
+            cells.append(("markdown", _uncomment(body)))
+        else:
+            title = header.strip()
+            cells.append(("code", "\n".join(body).strip("\n"), {"title": title} if title else {}))
+    return _build(Path(path).stem, cells, "python")
 
 
 def export_ipynb(t: Template, path: str) -> None:
