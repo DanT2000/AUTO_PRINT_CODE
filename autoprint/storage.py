@@ -1,0 +1,268 @@
+"""Хранилище: настройки (settings.json) и база образцов (templates.json).
+
+Обе лежат в папке data/ рядом с приложением — их легко забэкапить или перенести.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+
+
+def app_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+# AUTOPRINT_DATA — другая папка данных (для тестов, чтобы не трогать рабочую базу)
+DATA_DIR = Path(os.environ.get("AUTOPRINT_DATA") or app_dir() / "data")
+SETTINGS_FILE = DATA_DIR / "settings.json"
+TEMPLATES_FILE = DATA_DIR / "templates.json"
+
+
+def _atomic_write(path: Path, data: dict, backup: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    if backup and path.exists():
+        os.replace(path, path.with_suffix(path.suffix + ".bak"))
+    os.replace(tmp, path)
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+# ---------------------------------------------------------------- настройки
+
+PROFILE_PLAIN = "plain"
+PROFILE_IDE = "ide"
+PROFILES = {
+    PROFILE_PLAIN: "Блокнот / простое поле",
+    PROFILE_IDE: "IDE: VS Code, веб-IDE, Jupyter",
+}
+
+
+@dataclass
+class Settings:
+    hotkey_toggle: str = "Ctrl+F9"     # старт / пауза / продолжить
+    hotkey_restart: str = "Ctrl+F10"   # начать сначала
+    hotkey_stop: str = "Ctrl+F11"      # остановить
+    hotkey_next_block: str = "Ctrl+F12"        # следующий блок кода (через задачи)
+    hotkey_prev_block: str = "Ctrl+Shift+F12"  # предыдущий блок кода
+    hotkey_next_tab: str = ""                  # следующая вкладка-образец
+
+    cpm: int = 320                     # скорость, символов в минуту
+    jitter: int = 35                   # разброс задержки, %
+    newline_pause_ms: int = 220        # доп. пауза после Enter
+    punct_pause_ms: int = 50           # доп. пауза после , ; : ) и т.п.
+    fast_indent: bool = True           # отступы печатаются быстро
+    key_gap_ms: int = 30               # мин. интервал между нажатиями (надёжность ввода)
+    tab_width: int = 4                 # табы в коде заменяются пробелами
+    selection_whole_lines: bool = True # выделение в образце расширяется до целых строк
+
+    profile: str = PROFILE_IDE
+    esc_before_enter: bool = False     # закрывать подсказки Esc перед Enter (не для Jupyter!)
+
+    sound_enabled: bool = True
+    sound_volume: int = 35             # 0..100
+    sound_style: str = "soft"          # soft | mechanical | typewriter
+
+    hotkey_start_delay_ms: int = 150   # пауза перед стартом по хоткею
+    button_countdown_s: int = 3        # отсчёт при старте кнопкой в окне
+    minimize_on_button_start: bool = True
+    autopause_on_focus_change: bool = True
+    guard_enabled: bool = True         # пауза при нажатии клавиши / клике во время печати
+    auto_advance: bool = False         # по окончании выбрать следующий блок кода
+    always_on_top: bool = False
+
+    open_tabs: list = field(default_factory=list)
+    current_tab: str = ""
+    window_geometry: str = ""
+    splitter_state: str = ""
+
+    @classmethod
+    def load(cls) -> "Settings":
+        s = cls()
+        try:
+            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return s
+        known = {f.name: f.type for f in fields(cls)}
+        for k, v in raw.items():
+            if k in known and type(v) is type(getattr(s, k)):
+                setattr(s, k, v)
+        return s
+
+    def save(self) -> None:
+        _atomic_write(SETTINGS_FILE, asdict(self))
+
+
+# ---------------------------------------------------------------- образцы
+
+BLOCK_MARKDOWN = "markdown"
+BLOCK_CODE = "code"
+
+# Типы Markdown-блоков: ключ → (значок, название, цвет полоски)
+ROLES = {
+    "text": ("📝", "Текст", "#8b949e"),
+    "task": ("📋", "Условие", "#3b82f6"),
+    "explain": ("💡", "Пояснение", "#d29922"),
+    "hint": ("🔎", "Подсказка", "#a855f7"),
+}
+
+
+@dataclass
+class Block:
+    type: str
+    text: str = ""
+    lang: str = "python"
+    sel: list[int] = field(default_factory=list)  # [start, end] — выделение в блоке кода
+    id: str = field(default_factory=new_id)
+    role: str = "text"   # для Markdown-блока: text | task | explain | hint (см. ROLES)
+    title: str = ""      # свой заголовок блока; пусто → название по типу
+
+    def display_title(self, code_number: int = 0) -> str:
+        if self.title.strip():
+            return self.title.strip()
+        if self.type == BLOCK_CODE:
+            return f"Код {code_number}" if code_number else "Код"
+        return ROLES.get(self.role, ROLES["text"])[1]
+
+
+@dataclass
+class Task:
+    title: str
+    blocks: list[Block] = field(default_factory=list)
+    id: str = field(default_factory=new_id)
+
+    def code_blocks(self) -> list[Block]:
+        return [b for b in self.blocks if b.type == BLOCK_CODE]
+
+
+@dataclass
+class Template:
+    """Образец — набор задач (например, одно занятие)."""
+    title: str
+    tasks: list[Task] = field(default_factory=list)
+    active_task: str = ""
+    active_block: str = ""
+    id: str = field(default_factory=new_id)
+    updated: float = field(default_factory=time.time)
+
+    def task(self, task_id: str) -> Task | None:
+        return next((t for t in self.tasks if t.id == task_id), None)
+
+    def find_block(self, block_id: str) -> tuple[Task, Block] | None:
+        for t in self.tasks:
+            for b in t.blocks:
+                if b.id == block_id:
+                    return t, b
+        return None
+
+    def all_code_blocks(self) -> list[tuple[Task, Block]]:
+        return [(t, b) for t in self.tasks for b in t.blocks if b.type == BLOCK_CODE]
+
+
+def new_task(title: str = "Новая задача") -> Task:
+    return Task(title=title, blocks=[Block(BLOCK_MARKDOWN, role="task", text=f"## {title}\n\n"), Block(BLOCK_CODE, "")])
+
+
+SAMPLE_TASKS = [
+    ("Сумма чисел",
+     "## Задача 1. Сумма чисел\n\nНапишите функцию `total(nums)`, которая возвращает сумму "
+     "чисел списка.\n\n- без встроенной `sum()`\n- пустой список → `0`",
+     "def total(nums):\n    result = 0\n    for n in nums:\n        result += n\n    return result\n"
+     "\n\nprint(total([1, 2, 3]))  # 6\nprint(\"Готово!\")"),
+    ("Чётные числа",
+     "## Задача 2. Чётные числа\n\nВыведите все чётные числа от 0 до 10.",
+     "for i in range(0, 11, 2):\n    print(i)"),
+]
+
+
+def sample_template() -> Template:
+    return Template(title="Пример занятия",
+                    tasks=[Task(t, [Block(BLOCK_MARKDOWN, md, role="task"), Block(BLOCK_CODE, code)])
+                           for t, md, code in SAMPLE_TASKS])
+
+
+def _block_from(d: dict) -> Block:
+    return Block(**{k: v for k, v in d.items() if k in Block.__dataclass_fields__})
+
+
+def _template_from(d: dict) -> Template:
+    if "tasks" in d:
+        tasks = [Task(title=t.get("title", "Задача"), blocks=[_block_from(b) for b in t.get("blocks", [])],
+                      id=t.get("id") or new_id()) for t in d["tasks"]]
+    else:  # плоский список блоков → одна задача
+        tasks = [Task(title="Задача 1", blocks=[_block_from(b) for b in d.get("blocks", [])])]
+    return Template(title=d.get("title", "Без названия"), tasks=tasks,
+                    active_task=d.get("active_task", ""), active_block=d.get("active_block", ""),
+                    id=d.get("id") or new_id(), updated=d.get("updated", time.time()))
+
+
+def _fresh_ids(t: Template) -> Template:
+    for task in t.tasks:
+        task.id = new_id()
+        for b in task.blocks:
+            b.id = new_id()
+    t.id, t.active_task, t.active_block = new_id(), "", ""
+    return t
+
+
+class TemplateStore:
+    def __init__(self) -> None:
+        self.templates: list[Template] = []
+        self.load()
+
+    def load(self) -> None:
+        try:
+            raw = json.loads(TEMPLATES_FILE.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            self.templates = [sample_template()]
+            self.save()
+            return
+        except (OSError, ValueError) as e:
+            raise RuntimeError(f"Не удалось прочитать {TEMPLATES_FILE}: {e}") from e
+        self.templates = [_template_from(t) for t in raw.get("templates", [])]
+
+    def save(self) -> None:
+        _atomic_write(TEMPLATES_FILE, {"version": 2, "templates": [asdict(t) for t in self.templates]},
+                      backup=True)
+
+    def get(self, tid: str) -> Template | None:
+        return next((t for t in self.templates if t.id == tid), None)
+
+    def add(self, title: str) -> Template:
+        t = Template(title=title, tasks=[new_task("Задача 1")])
+        self.templates.append(t)
+        return t
+
+    def insert(self, t: Template) -> Template:
+        self.templates.append(t)
+        return t
+
+    def duplicate(self, t: Template) -> Template:
+        copy = _fresh_ids(_template_from(asdict(t)))
+        copy.title = t.title + " (копия)"
+        self.templates.insert(self.templates.index(t) + 1, copy)
+        return copy
+
+    def remove(self, t: Template) -> None:
+        self.templates.remove(t)
+
+    # --- обмен одним образцом (.json) ---
+    @staticmethod
+    def export_template(t: Template, path: str) -> None:
+        Path(path).write_text(json.dumps({"autoprintcode_template": asdict(t)}, ensure_ascii=False, indent=2),
+                              encoding="utf-8")
+
+    @staticmethod
+    def read_template_file(path: str) -> Template:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        return _fresh_ids(_template_from(raw.get("autoprintcode_template", raw)))

@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>EDITOR-CM6 loading</title>
+<style>body{margin:0}#ed{height:100vh}#ed .cm-editor{height:100%}</style></head>
+<body><div id="ed"></div>
+<script type="module">
+// CodeMirror 6 (как в JupyterLab 4): basicSetup = автоотступы, автоскобки, автодополнение
+import {EditorView, basicSetup, python, javascript} from "./cm6bundle.js";
+const lang = location.hash === "#js" ? javascript() : python();
+let timer = null;
+const view = new EditorView({
+  parent: document.getElementById("ed"),
+  extensions: [basicSetup, lang, EditorView.updateListener.of(u => {
+    if (!u.docChanged) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      // содержимое → заголовок окна (тест читает его через WinAPI)
+      document.title = "RESULT:" + btoa(unescape(encodeURIComponent(view.state.doc.toString())));
+    }, 2500);
+  })],
+});
+view.focus();
+window.addEventListener("focus", () => view.focus());
+setInterval(() => { if (!view.hasFocus) view.focus(); }, 300);
+document.title = "EDITOR-CM6 ready";
+</script></body></html>

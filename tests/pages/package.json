@@ -1,0 +1,13 @@
+{
+  "name": "autoprint-test-pages",
+  "private": true,
+  "scripts": {
+    "build": "esbuild cm6-entry.js --bundle --format=esm --minify --outfile=cm6bundle.js"
+  },
+  "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.5",
+    "@codemirror/lang-python": "^6.2.1",
+    "codemirror": "^6.0.2",
+    "esbuild": "^0.28.2"
+  }
+}

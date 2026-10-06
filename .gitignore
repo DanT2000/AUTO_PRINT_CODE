@@ -1,0 +1,44 @@
+# --- Рабочие данные пользователя (образцы, настройки, журнал) ---
+data/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.python-version
+
+# --- Сборка (PyInstaller) ---
+build/
+dist/
+*.spec.bak
+
+# --- Подпись кода: сертификаты и ключи НИКОГДА не коммитить ---
+*.pfx
+*.p12
+*.cer
+*.key
+*.pem
+signing/
+
+# --- Тесты ---
+tests/_run/
+tests/pages/node_modules/
+tests/pages/cm6bundle.js
+tests/pages/package-lock.json
+
+# --- Временное и служебное ---
+*.log
+*.tmp
+*.lock
+.lock
+*.7z
+*.zip
+
+# --- Редакторы и ОС ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
