@@ -3,14 +3,15 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QSizePolicy, QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout)
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+                               QMenu, QSizePolicy, QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout)
 
 from ..highlighter import LANGUAGES
-from ..storage import BLOCK_CODE, ROLES, Block
+from ..storage import BLOCK_CODE, BLOCK_MARKDOWN, ROLES, Block
 from .code_editor import CodeEditor, code_font
 
 ARMED_COLOR = "#2ea043"
+ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 50, 300, 10
 
 
 def _tool(text: str, tip: str) -> QToolButton:
@@ -30,6 +31,8 @@ class BlockWidget(QFrame):
     move_requested = Signal(object, int)          # (виджет, -1|+1)
     delete_requested = Signal(object)
     type_requested = Signal(object, str)          # (виджет, роль | "code")
+    insert_requested = Signal(object, int, str)   # (виджет, 0 — выше | 1 — ниже, тип нового блока)
+    zoom_changed = Signal(int)                    # новый масштаб блока, % — для строки состояния
 
     def __init__(self, block: Block, code_number: int = 0) -> None:
         super().__init__()
@@ -41,7 +44,7 @@ class BlockWidget(QFrame):
         lay.setContentsMargins(8, 6, 8, 8)
         lay.setSpacing(4)
 
-        # шапка: [тип][заголовок][доп. слева] … [доп. справа][↑][↓][⋯][✕]
+        # шапка: [тип][заголовок][доп. слева] … [доп. справа][＋↑][＋↓][↑][↓][✕]
         self.header = QHBoxLayout()
         self.header.setSpacing(4)
         self.kind = QComboBox()
@@ -71,6 +74,15 @@ class BlockWidget(QFrame):
         self.right_slot = QHBoxLayout()
         self.header.addLayout(self.right_slot)
 
+        for text, tip, after in (("＋↑", "Вставить блок выше", 0), ("＋↓", "Вставить блок ниже", 1)):
+            b = _tool(text, tip)
+            m = QMenu(b)
+            m.addAction("📝 Текст (Markdown)", lambda a=after: self.insert_requested.emit(self, a, BLOCK_MARKDOWN))
+            m.addAction("💻 Блок кода", lambda a=after: self.insert_requested.emit(self, a, BLOCK_CODE))
+            b.setMenu(m)
+            b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+            self.header.addWidget(b)
+
         for text, tip, slot in (("↑", "Блок выше", lambda: self.move_requested.emit(self, -1)),
                                 ("↓", "Блок ниже", lambda: self.move_requested.emit(self, +1)),
                                 ("✕", "Удалить блок", lambda: self.delete_requested.emit(self))):
@@ -81,6 +93,21 @@ class BlockWidget(QFrame):
         self.body = QVBoxLayout()
         lay.addLayout(self.body)
         self._apply_role_style()
+
+    def zoom_by(self, steps: int) -> None:
+        self.apply_zoom(self.block.zoom + steps * ZOOM_STEP)
+
+    def apply_zoom(self, zoom: int) -> None:
+        """Масштаб только этого блока; хранится в самом блоке."""
+        zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
+        if zoom != self.block.zoom:
+            self.block.zoom = zoom
+            self.set_zoom(zoom)
+            self.changed.emit()
+        self.zoom_changed.emit(zoom)
+
+    def set_zoom(self, zoom: int) -> None:
+        """Шрифт содержимого под масштаб, % — переопределяют наследники."""
 
     def _update_placeholder(self) -> None:
         self.title.setPlaceholderText(Block(self.block.type, role=self.block.role, title="")
@@ -187,6 +214,14 @@ class MarkdownBlockWidget(BlockWidget):
     def toggle_mode(self) -> None:
         self.set_editing(self.stack.currentWidget() is self.view)
 
+    def set_zoom(self, zoom: int) -> None:
+        f = QApplication.font()
+        f.setPointSizeF(f.pointSizeF() * zoom / 100)
+        self.view.setFont(f)
+        self.edit.setFont(code_font(max(5, round(10 * zoom / 100))))
+        self._render()
+        self._fit()
+
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         QTimer.singleShot(0, self, self._fit)
@@ -233,6 +268,11 @@ class CodeBlockWidget(BlockWidget):
 
     def _fit(self) -> None:
         self.editor.setFixedHeight(self.editor.content_height())
+
+    def set_zoom(self, zoom: int) -> None:
+        self.editor.setFont(code_font(max(5, round(11 * zoom / 100))))
+        self.editor.update_gutter_width()
+        self._fit()
 
     def _on_lang(self, lang: str) -> None:
         self.block.lang = lang.strip().lower() or "text"

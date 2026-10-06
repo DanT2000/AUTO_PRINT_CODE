@@ -1,16 +1,44 @@
 """Вкладка образца: все блоки образца одной лентой."""
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget
 
 from ..storage import BLOCK_CODE, BLOCK_MARKDOWN, Block, Template
 from .blocks import BlockWidget, CodeBlockWidget, MarkdownBlockWidget, make_block_widget
 
 
+class ZoomWheelFilter(QObject):
+    """Ctrl/Shift + колёсико над блоком образца → масштаб этого блока, а не прокрутка.
+    Ставится на всё приложение: колёсико сначала получают сами редакторы внутри блоков."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._acc = 0   # тачпады шлют мелкие шаги — копим до одного «щелчка» колеса (120)
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() != QEvent.Type.Wheel or not isinstance(obj, QWidget):
+            return False
+        if not ev.modifiers() & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+            return False
+        w = obj
+        while w is not None and not isinstance(w, BlockWidget):
+            w = w.parentWidget()
+        if w is None:
+            return False
+        d = ev.angleDelta()
+        self._acc += d.y() or d.x()   # с Shift Qt иногда отдаёт шаг по горизонтали
+        steps = int(self._acc / 120)
+        self._acc -= steps * 120
+        if steps:
+            w.zoom_by(steps)
+        return True
+
+
 class TemplateView(QWidget):
     changed = Signal()            # содержимое образца изменилось → сохранить
     armed_changed = Signal(str)   # id активного блока кода
+    zoom_changed = Signal(int)    # масштаб какого-то блока изменился, %
 
     def __init__(self, template: Template) -> None:
         super().__init__()
@@ -52,6 +80,8 @@ class TemplateView(QWidget):
             if b.type == BLOCK_CODE:
                 n += 1
             wdg = make_block_widget(b, n)
+            if b.zoom != 100:
+                wdg.set_zoom(b.zoom)
             self._wire(wdg)
             self.page_lay.insertWidget(self.page_lay.count() - 1, wdg)
             self.widgets.append(wdg)
@@ -66,11 +96,17 @@ class TemplateView(QWidget):
         else:
             self.scroll.verticalScrollBar().setValue(0)
 
+    def reset_zoom(self) -> None:
+        for w in self.widgets:
+            w.apply_zoom(100)
+
     def _wire(self, wdg: BlockWidget) -> None:
         wdg.changed.connect(self.changed)
         wdg.move_requested.connect(self._move_block)
         wdg.delete_requested.connect(self._delete_block)
         wdg.type_requested.connect(self._change_type)
+        wdg.insert_requested.connect(self._insert_near)
+        wdg.zoom_changed.connect(self.zoom_changed)
         if isinstance(wdg, CodeBlockWidget):
             wdg.arm_requested.connect(lambda w: self.arm(w.block.id))
 
@@ -82,14 +118,26 @@ class TemplateView(QWidget):
                 w.set_number(n)
 
     def add_block(self, kind: str) -> None:
+        """Кнопки внизу: новый блок встаёт сразу после активного блока кода, а если активного нет — в конец."""
+        bl = self.template.blocks
+        active = self.template.find_block(self.template.active_block)
+        self._insert_block(bl.index(active) + 1 if active else len(bl), kind)
+
+    def _insert_near(self, wdg: BlockWidget, after: int, kind: str) -> None:
+        """Кнопки «＋↑» / «＋↓» в шапке блока."""
+        self._insert_block(self.template.blocks.index(wdg.block) + after, kind)
+
+    def _insert_block(self, idx: int, kind: str) -> None:
+        bl = self.template.blocks
         b = Block(kind, "")
         if kind == BLOCK_CODE:
-            last = next((x for x in reversed(self.template.blocks) if x.type == BLOCK_CODE), None)
+            last = next((x for x in reversed(bl[:idx]) if x.type == BLOCK_CODE), None) \
+                or next((x for x in bl if x.type == BLOCK_CODE), None)
             if last:
                 b.lang = last.lang
-        self.template.blocks.append(b)
+        bl.insert(idx, b)
         self._rebuild(keep_scroll=True)
-        wdg = self.widgets[-1]
+        wdg = self.widgets[idx]
         if isinstance(wdg, CodeBlockWidget):
             self.arm(b.id)
             wdg.editor.setFocus()

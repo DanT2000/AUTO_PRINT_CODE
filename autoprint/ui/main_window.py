@@ -6,7 +6,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QProgressBar, QPushButton, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
@@ -19,9 +19,9 @@ from ..importers import export_ipynb, import_ipynb, import_markdown
 from ..sounds import KeySoundPlayer
 from ..storage import PROFILES, Settings, Template, TemplateStore
 from ..typer import COUNTDOWN, FINISHED, IDLE, PAUSED, RUNNING, TypingEngine
-from .blocks import typing_slice
+from .blocks import BlockWidget, typing_slice
 from .settings_dialog import HOTKEYS, SettingsDialog
-from .template_view import TemplateView
+from .template_view import TemplateView, ZoomWheelFilter
 
 STATE_COLORS = {IDLE: "#3b82f6", COUNTDOWN: "#a855f7", RUNNING: "#2ea043", PAUSED: "#d29922",
                 FINISHED: "#3b82f6"}
@@ -53,7 +53,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings
         self.store = store
-        self.icons = {st: make_icon(c) for st, c in STATE_COLORS.items()}
+        self._zoom_filter = ZoomWheelFilter(self)
+        QApplication.instance().installEventFilter(self._zoom_filter)
+        self.icons ={st: make_icon(c) for st, c in STATE_COLORS.items()}
         self.setWindowIcon(self.icons[IDLE])
         self.setWindowTitle(f"{APP_NAME} {__version__}")
         self.resize(1200, 780)
@@ -207,6 +209,13 @@ class MainWindow(QMainWindow):
         self._act(m, "Предыдущий блок кода", lambda: self.cmd_block(-1), "Alt+Up")
         m.addSeparator()
         self._act(m, "Настройки…", self.open_settings, "Ctrl+,")
+        m = self.menuBar().addMenu("Вид")
+        self._act(m, "Блок крупнее", lambda: self._zoom_block(+1), "Ctrl+=")
+        self._act(m, "Блок мельче", lambda: self._zoom_block(-1), "Ctrl+-")
+        self._act(m, "Блок в обычный размер", lambda: self._zoom_block(0), "Ctrl+0")
+        self._act(m, "Все блоки образца в обычный размер", self._reset_zoom)
+        m.addSeparator()
+        m.addAction("Ctrl/Shift + колёсико — масштаб блока под мышью").setEnabled(False)
         m = self.menuBar().addMenu("Справка")
         self._act(m, "Как пользоваться", self.show_help, "F1")
 
@@ -409,6 +418,7 @@ class MainWindow(QMainWindow):
             if not t:
                 return None
             v = TemplateView(t)
+            v.zoom_changed.connect(lambda z: self.statusBar().showMessage(f"Масштаб блока: {z}%", 1500))
             v.changed.connect(self._touch)
             v.armed_changed.connect(lambda _bid, v=v: self._on_armed(v))
             self.tabs.addTab(v, t.title)
@@ -416,6 +426,29 @@ class MainWindow(QMainWindow):
         if activate:
             self.tabs.setCurrentWidget(v)
         return v
+
+    # ---- масштаб блока (у каждого блока свой)
+    def _target_block(self) -> BlockWidget | None:
+        """Блок под мышью, иначе блок с курсором ввода, иначе активный блок кода."""
+        v = self.current_view()
+        if not v:
+            return None
+        for w in (QApplication.widgetAt(QCursor.pos()), QApplication.focusWidget()):
+            while w is not None and not isinstance(w, BlockWidget):
+                w = w.parentWidget()
+            if w is not None and w in v.widgets:
+                return w
+        return v.code_widget(v.template.active_block)
+
+    def _zoom_block(self, steps: int) -> None:
+        w = self._target_block()
+        if w:
+            w.zoom_by(steps) if steps else w.apply_zoom(100)
+
+    def _reset_zoom(self) -> None:
+        v = self.current_view()
+        if v:
+            v.reset_zoom()
 
     def close_tab(self, index: int) -> None:
         v = self.tabs.widget(index)

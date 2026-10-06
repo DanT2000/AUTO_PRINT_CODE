@@ -74,6 +74,12 @@ class CodeEditor(QPlainTextEdit):
     def _update_gutter_width(self, *_):
         self.setViewportMargins(self.gutter_width(), 0, 0, 0)
 
+    def update_gutter_width(self) -> None:
+        """После смены шрифта (масштаб): ширина колонки номеров строк и её геометрия."""
+        self._update_gutter_width()
+        cr = self.contentsRect()
+        self._gutter.setGeometry(QRect(cr.left(), cr.top(), self.gutter_width(), cr.height()))
+
     def _update_gutter(self, rect, dy):
         if dy:
             self._gutter.scroll(0, dy)

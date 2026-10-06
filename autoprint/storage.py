@@ -126,6 +126,7 @@ class Block:
     id: str = field(default_factory=new_id)
     role: str = "text"   # для Markdown-блока: text | task | explain | hint (см. ROLES)
     title: str = ""      # свой заголовок блока; пусто → название по типу
+    zoom: int = 100      # масштаб содержимого блока, % (Ctrl/Shift + колёсико)
 
     def display_title(self, code_number: int = 0) -> str:
         if self.title.strip():
