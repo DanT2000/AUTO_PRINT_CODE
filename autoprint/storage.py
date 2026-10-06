@@ -53,7 +53,7 @@ class Settings:
     hotkey_toggle: str = "Ctrl+F9"     # старт / пауза / продолжить
     hotkey_restart: str = "Ctrl+F10"   # начать сначала
     hotkey_stop: str = "Ctrl+F11"      # остановить
-    hotkey_next_block: str = "Ctrl+F12"        # следующий блок кода (через задачи)
+    hotkey_next_block: str = "Ctrl+F12"        # следующий блок кода
     hotkey_prev_block: str = "Ctrl+Shift+F12"  # предыдущий блок кода
     hotkey_next_tab: str = ""                  # следующая вкладка-образец
 
@@ -136,82 +136,67 @@ class Block:
 
 
 @dataclass
-class Task:
+class Template:
+    """Образец (например, одно занятие) — список блоков: условия, пояснения и код вперемешку."""
     title: str
     blocks: list[Block] = field(default_factory=list)
+    active_block: str = ""
     id: str = field(default_factory=new_id)
+    updated: float = field(default_factory=time.time)
+
+    def find_block(self, block_id: str) -> Block | None:
+        return next((b for b in self.blocks if b.id == block_id), None)
 
     def code_blocks(self) -> list[Block]:
         return [b for b in self.blocks if b.type == BLOCK_CODE]
 
 
-@dataclass
-class Template:
-    """Образец — набор задач (например, одно занятие)."""
-    title: str
-    tasks: list[Task] = field(default_factory=list)
-    active_task: str = ""
-    active_block: str = ""
-    id: str = field(default_factory=new_id)
-    updated: float = field(default_factory=time.time)
-
-    def task(self, task_id: str) -> Task | None:
-        return next((t for t in self.tasks if t.id == task_id), None)
-
-    def find_block(self, block_id: str) -> tuple[Task, Block] | None:
-        for t in self.tasks:
-            for b in t.blocks:
-                if b.id == block_id:
-                    return t, b
-        return None
-
-    def all_code_blocks(self) -> list[tuple[Task, Block]]:
-        return [(t, b) for t in self.tasks for b in t.blocks if b.type == BLOCK_CODE]
-
-
-def new_task(title: str = "Новая задача") -> Task:
-    return Task(title=title, blocks=[Block(BLOCK_MARKDOWN, role="task", text=f"## {title}\n\n"), Block(BLOCK_CODE, "")])
-
-
 SAMPLE_TASKS = [
-    ("Сумма чисел",
-     "## Задача 1. Сумма чисел\n\nНапишите функцию `total(nums)`, которая возвращает сумму "
+    ("## Задача 1. Сумма чисел\n\nНапишите функцию `total(nums)`, которая возвращает сумму "
      "чисел списка.\n\n- без встроенной `sum()`\n- пустой список → `0`",
      "def total(nums):\n    result = 0\n    for n in nums:\n        result += n\n    return result\n"
      "\n\nprint(total([1, 2, 3]))  # 6\nprint(\"Готово!\")"),
-    ("Чётные числа",
-     "## Задача 2. Чётные числа\n\nВыведите все чётные числа от 0 до 10.",
+    ("## Задача 2. Чётные числа\n\nВыведите все чётные числа от 0 до 10.",
      "for i in range(0, 11, 2):\n    print(i)"),
 ]
 
 
 def sample_template() -> Template:
     return Template(title="Пример занятия",
-                    tasks=[Task(t, [Block(BLOCK_MARKDOWN, md, role="task"), Block(BLOCK_CODE, code)])
-                           for t, md, code in SAMPLE_TASKS])
+                    blocks=[b for md, code in SAMPLE_TASKS
+                            for b in (Block(BLOCK_MARKDOWN, md, role="task"), Block(BLOCK_CODE, code))])
 
 
 def _block_from(d: dict) -> Block:
     return Block(**{k: v for k, v in d.items() if k in Block.__dataclass_fields__})
 
 
+def _flatten_tasks(tasks: list[dict]) -> list[Block]:
+    """Старый формат (до v0.3): образец → задачи → блоки. Задачи сливаются в один список блоков.
+    Если задач несколько, название задачи, которого нет в её тексте, становится заголовком перед её блоками."""
+    blocks = []
+    for t in tasks:
+        tb = [_block_from(b) for b in t.get("blocks", [])]
+        title = str(t.get("title", "")).strip()
+        if len(tasks) > 1 and title and not any(b.type == BLOCK_MARKDOWN and title in b.text for b in tb):
+            blocks.append(Block(BLOCK_MARKDOWN, f"## {title}"))
+        blocks += tb
+    return blocks
+
+
 def _template_from(d: dict) -> Template:
     if "tasks" in d:
-        tasks = [Task(title=t.get("title", "Задача"), blocks=[_block_from(b) for b in t.get("blocks", [])],
-                      id=t.get("id") or new_id()) for t in d["tasks"]]
-    else:  # плоский список блоков → одна задача
-        tasks = [Task(title="Задача 1", blocks=[_block_from(b) for b in d.get("blocks", [])])]
-    return Template(title=d.get("title", "Без названия"), tasks=tasks,
-                    active_task=d.get("active_task", ""), active_block=d.get("active_block", ""),
+        blocks = _flatten_tasks(d["tasks"])
+    else:
+        blocks = [_block_from(b) for b in d.get("blocks", [])]
+    return Template(title=d.get("title", "Без названия"), blocks=blocks, active_block=d.get("active_block", ""),
                     id=d.get("id") or new_id(), updated=d.get("updated", time.time()))
 
 
 def _fresh_ids(t: Template) -> Template:
-    for task in t.tasks:
-        task.id = new_id()
-        for b in task.blocks:
-            b.id = new_id()
-    t.id, t.active_task, t.active_block = new_id(), "", ""
+    for b in t.blocks:
+        b.id = new_id()
+    t.id, t.active_block = new_id(), ""
     return t
 
 
@@ -229,17 +214,23 @@ class TemplateStore:
             return
         except (OSError, ValueError) as e:
             raise RuntimeError(f"Не удалось прочитать {TEMPLATES_FILE}: {e}") from e
+        if raw.get("version", 1) < 3:
+            # одноразовая копия базы в старом формате (с задачами) — на случай отката
+            old = TEMPLATES_FILE.with_suffix(".v2.json")
+            if not old.exists():
+                old.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
         self.templates = [_template_from(t) for t in raw.get("templates", [])]
 
     def save(self) -> None:
-        _atomic_write(TEMPLATES_FILE, {"version": 2, "templates": [asdict(t) for t in self.templates]},
+        _atomic_write(TEMPLATES_FILE, {"version": 3, "templates": [asdict(t) for t in self.templates]},
                       backup=True)
 
     def get(self, tid: str) -> Template | None:
         return next((t for t in self.templates if t.id == tid), None)
 
     def add(self, title: str) -> Template:
-        t = Template(title=title, tasks=[new_task("Задача 1")])
+        t = Template(title=title, blocks=[Block(BLOCK_MARKDOWN, "## Задача 1\n\n", role="task"),
+                                          Block(BLOCK_CODE, "")])
         self.templates.append(t)
         return t
 

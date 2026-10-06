@@ -1,4 +1,4 @@
-"""Виджеты блоков задачи: текстовый (Markdown) и код."""
+"""Виджеты блоков образца: текстовый (Markdown) и код."""
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal
@@ -30,7 +30,6 @@ class BlockWidget(QFrame):
     move_requested = Signal(object, int)          # (виджет, -1|+1)
     delete_requested = Signal(object)
     type_requested = Signal(object, str)          # (виджет, роль | "code")
-    move_to_task_requested = Signal(object)       # показать меню задач
 
     def __init__(self, block: Block, code_number: int = 0) -> None:
         super().__init__()
@@ -74,7 +73,6 @@ class BlockWidget(QFrame):
 
         for text, tip, slot in (("↑", "Блок выше", lambda: self.move_requested.emit(self, -1)),
                                 ("↓", "Блок ниже", lambda: self.move_requested.emit(self, +1)),
-                                ("⇄", "Перенести в другую задачу", lambda: self.move_to_task_requested.emit(self)),
                                 ("✕", "Удалить блок", lambda: self.delete_requested.emit(self))):
             b = _tool(text, tip)
             b.clicked.connect(slot)

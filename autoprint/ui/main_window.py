@@ -331,9 +331,8 @@ class MainWindow(QMainWindow):
         self.library.blockSignals(True)
         self.library.clear()
         for t in self.store.templates:
-            n_tasks = len(t.tasks)
             it = QListWidgetItem(t.title)
-            it.setToolTip(f"{t.title}\nЗадач: {n_tasks}")
+            it.setToolTip(f"{t.title}\nБлоков кода: {len(t.code_blocks())}")
             it.setData(Qt.ItemDataRole.UserRole, t.id)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
             self.library.addItem(it)
@@ -347,7 +346,7 @@ class MainWindow(QMainWindow):
         for i in range(self.library.count()):
             it = self.library.item(i)
             t = self.store.get(it.data(Qt.ItemDataRole.UserRole))
-            hay = (t.title + " " + " ".join(task.title for task in t.tasks)).lower() if t else ""
+            hay = t.title.lower() if t else ""
             it.setHidden(bool(q) and q not in hay)
 
     def _library_menu(self, pos) -> None:
@@ -460,7 +459,7 @@ class MainWindow(QMainWindow):
 
     def _delete_template(self, t: Template) -> None:
         if QMessageBox.question(self, "Удалить образец",
-                                f"Удалить образец «{t.title}» со всеми задачами?\n"
+                                f"Удалить образец «{t.title}»?\n"
                                 "(Резервная копия прошлой версии базы — data/templates.json.bak)") \
                 != QMessageBox.StandardButton.Yes:
             return
@@ -488,13 +487,13 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "Импорт", f"{Path(p).name}: {e}")
                 continue
-            if not t.tasks:
+            if not t.blocks:
                 QMessageBox.information(self, "Импорт", f"{Path(p).name}: нет ячеек для импорта.")
                 continue
             self.store.insert(t)
             last = t
-            self._notify(f"Импортировано «{t.title}»: задач — {len(t.tasks)}, "
-                         f"блоков кода — {len(t.all_code_blocks())}.")
+            self._notify(f"Импортировано «{t.title}»: блоков — {len(t.blocks)}, "
+                         f"из них кода — {len(t.code_blocks())}.")
         if last:
             self._touch()
             self._fill_library(last.id)
@@ -575,14 +574,12 @@ class MainWindow(QMainWindow):
 
     # ================================================================ печать
     def _armed(self):
-        """Активный блок текущей вкладки → (view, task, block) или None."""
+        """Активный блок текущей вкладки → (view, block) или None."""
         v = self.current_view()
         if not v or not v.template.active_block:
             return None
-        found = v.template.find_block(v.template.active_block)
-        if not found:
-            return None
-        return v, found[0], found[1]
+        block = v.template.find_block(v.template.active_block)
+        return (v, block) if block else None
 
     def _on_armed(self, v: TemplateView) -> None:
         self._update_armed_label()
@@ -592,19 +589,19 @@ class MainWindow(QMainWindow):
         if not a:
             self.armed_lbl.setText("<span style='color:gray'>Нет активного блока кода — щёлкните по блоку кода</span>")
             return
-        v, task, block = a
-        n = [b.id for b in task.code_blocks()].index(block.id) + 1
+        v, block = a
+        n = [b.id for b in v.template.code_blocks()].index(block.id) + 1
         text, _ = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
         part = "выделенные строки" if block.sel else "весь блок"
         lines = text.count("\n") + 1 if text else 0
-        self.armed_lbl.setText(f"Печатать: <b>{task.title}</b> · {block.display_title(n)} · {part} "
+        self.armed_lbl.setText(f"Печатать: <b>{v.template.title}</b> · {block.display_title(n)} · {part} "
                                f"({lines} стр., {len(text)} симв.)")
 
     def _job_for_armed(self) -> dict | None:
         a = self._armed()
         if not a:
             return None
-        v, task, block = a
+        v, block = a
         text, base = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
         if not text.strip():
             return None
@@ -665,18 +662,16 @@ class MainWindow(QMainWindow):
         v = self.current_view()
         if not v:
             return
-        blocks = v.template.all_code_blocks()
-        if not blocks:
+        ids = [b.id for b in v.template.code_blocks()]
+        if not ids:
             return
-        ids = [b.id for _, b in blocks]
         cur = v.template.active_block
         i = ids.index(cur) if cur in ids else -1
         j = max(0, min(len(ids) - 1, i + d))
         if self.engine.state in (RUNNING, COUNTDOWN, PAUSED):
             self.cmd_stop()
         v.go_to_block(ids[j])
-        task, _ = v.template.find_block(ids[j])
-        self._notify(f"Активный блок: {task.title} · код {[b.id for b in task.code_blocks()].index(ids[j]) + 1}"
+        self._notify(f"Активный блок: {v.template.find_block(ids[j]).display_title(j + 1)}"
                      f" ({j + 1} из {len(ids)})", tray=not self.isActiveWindow())
 
     def cmd_next_tab(self, d: int = 1) -> None:
@@ -750,7 +745,7 @@ class MainWindow(QMainWindow):
         if self.settings.auto_advance:
             v = self.view_for(self.job["tid"]) if self.job else None
             if v and v is self.current_view():
-                ids = [b.id for _, b in v.template.all_code_blocks()]
+                ids = [b.id for b in v.template.code_blocks()]
                 if self.job["bid"] in ids and ids.index(self.job["bid"]) + 1 < len(ids):
                     QTimer.singleShot(400, lambda: self.cmd_block(+1))
 
@@ -770,7 +765,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Как пользоваться", f"""\
 <h3>Быстрый старт</h3>
 <ol>
-<li>Слева выберите образец (или <b>Импорт</b> из .ipynb). Образец содержит задачи, задача — условие и блоки кода.</li>
+<li>Слева выберите образец (или <b>Импорт</b> из .ipynb). Образец — это лента блоков: условия, пояснения и код.</li>
 <li>Щёлкните по блоку кода — он станет <b>активным</b> (зелёная рамка).
 Выделите строки, если нужно напечатать только их.</li>
 <li>Перейдите в целевое окно (Блокнот, VS Code, браузер, Jupyter), поставьте курсор.</li>
