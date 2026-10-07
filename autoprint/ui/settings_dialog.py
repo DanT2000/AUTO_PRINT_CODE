@@ -1,6 +1,7 @@
 """Окно настроек."""
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 
 from PySide6.QtCore import Qt, Signal
@@ -9,9 +10,12 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, 
                                QHBoxLayout, QKeySequenceEdit, QLabel, QMessageBox, QPushButton, QSlider,
                                QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
+from .. import __version__
 from ..hotkeys import parse_hotkey
 from ..sounds import STYLES
 from ..storage import PROFILE_IDE, PROFILES, Settings
+from ..updater import MODE_FROZEN, install_mode
+from .updates import INTERVALS, MODE_DOWNLOAD, MODE_NOTIFY, UPDATE_MODES
 
 HOTKEYS = [
     ("hotkey_toggle", "Старт / пауза / продолжить"),
@@ -53,6 +57,7 @@ def _spin(lo: int, hi: int, val: int, suffix: str = "", step: int = 1) -> QSpinB
 
 class SettingsDialog(QDialog):
     test_sound = Signal(str, int)   # (стиль, громкость)
+    check_updates = Signal()
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -208,6 +213,60 @@ class SettingsDialog(QDialog):
             f.addRow(cb)
         tabs.addTab(w, "Поведение")
 
+        # ---- обновления
+        w = QWidget()
+        f = QFormLayout(w)
+        self.upd_auto = QCheckBox("Проверять обновления автоматически")
+        self.upd_auto.setChecked(s.update_auto_check)
+        self.upd_interval = QComboBox()
+        for k, v in INTERVALS.items():
+            self.upd_interval.addItem(v, k)
+        self.upd_interval.setCurrentIndex(max(0, self.upd_interval.findData(s.update_interval_h)))
+        self.upd_mode = QComboBox()
+        # собранный .exe сам себя не заменит — ему доступно только «сообщить»
+        modes = {MODE_NOTIFY: UPDATE_MODES[MODE_NOTIFY]} if install_mode() == MODE_FROZEN else UPDATE_MODES
+        for k, v in modes.items():
+            self.upd_mode.addItem(v, k)
+        self.upd_mode.setCurrentIndex(max(0, self.upd_mode.findData(s.update_mode)))
+        self.upd_mode.setToolTip("Обновление никогда не ставится во время печати и не прерывает занятие: "
+                                 "в худшем случае новая версия запустится в следующий раз.")
+        self.upd_beta = QCheckBox("Предлагать бета-версии (pre-release)")
+        self.upd_beta.setChecked(s.update_prerelease)
+        for wdg in (self.upd_interval, self.upd_mode):
+            wdg.setEnabled(s.update_auto_check)
+            self.upd_auto.toggled.connect(wdg.setEnabled)
+
+        last = (time.strftime("%d.%m.%Y %H:%M", time.localtime(s.update_last_check))
+                if s.update_last_check else "ещё не было")
+        info = QLabel(f"Установлена версия <b>{__version__}</b> · последняя проверка: {last}")
+        info.setTextFormat(Qt.TextFormat.RichText)
+
+        btn_check = QPushButton("Проверить сейчас")
+        btn_check.clicked.connect(self.check_updates)
+        brow = QHBoxLayout()
+        brow.addWidget(btn_check)
+        brow.addStretch(1)
+
+        f.addRow(self.upd_auto)
+        f.addRow("Как часто:", self.upd_interval)
+        f.addRow("Найдя новую версию:", self.upd_mode)
+        f.addRow(self.upd_beta)
+        f.addRow(info)
+        f.addRow(brow)
+
+        self._unskip = False
+        if s.update_skip_version:
+            unskip = QPushButton(f"Снова предлагать версию {s.update_skip_version}")
+            unskip.clicked.connect(lambda: (setattr(self, "_unskip", True), unskip.setEnabled(False)))
+            f.addRow(unskip)
+
+        note = QLabel("Ваши образцы и настройки при обновлении не меняются. Во время печати программа "
+                      "не обновляется и не отвлекает уведомлениями.")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+        f.addRow(note)
+        tabs.addTab(w, "Обновления")
+
         bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         bb.accepted.connect(self._accept)
         bb.rejected.connect(self.reject)
@@ -261,5 +320,11 @@ class SettingsDialog(QDialog):
         s.guard_enabled = self.guard.isChecked()
         s.auto_advance = self.advance.isChecked()
         s.always_on_top = self.on_top.isChecked()
+        s.update_auto_check = self.upd_auto.isChecked()
+        s.update_interval_h = self.upd_interval.currentData()
+        s.update_mode = self.upd_mode.currentData() or MODE_DOWNLOAD
+        s.update_prerelease = self.upd_beta.isChecked()
+        if self._unskip:
+            s.update_skip_version = ""
         self.result_settings = s
         self.accept()

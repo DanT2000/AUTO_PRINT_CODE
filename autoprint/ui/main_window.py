@@ -1,6 +1,7 @@
 """Главное окно: библиотека образцов, вкладки, панель управления печатью, трей."""
 from __future__ import annotations
 
+import logging
 import struct
 import time
 from dataclasses import asdict
@@ -10,10 +11,10 @@ from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QRect, Qt, QT
 from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QProgressBar, QPushButton, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
+                               QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
                                QToolButton, QVBoxLayout, QWidget)
 
-from .. import APP_NAME, __version__, taskbar
+from .. import APP_NAME, __version__, taskbar, updater
 from ..comments import strip_comments
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
@@ -24,6 +25,7 @@ from ..typer import COUNTDOWN, FINISHED, IDLE, PAUSED, RUNNING, TypingEngine
 from .blocks import BlockWidget, typing_slice
 from .settings_dialog import HOTKEYS, SettingsDialog
 from .template_view import TemplateView, ZoomWheelFilter
+from .updates import MODE_AUTO, MODE_DOWNLOAD, UpdateDialog, UpdateManager
 
 STATE_COLORS = {IDLE: "#3b82f6", COUNTDOWN: "#a855f7", RUNNING: "#2ea043", PAUSED: "#d29922",
                 FINISHED: "#3b82f6"}
@@ -32,6 +34,8 @@ STATE_TEXT = {IDLE: "Готов", COUNTDOWN: "Отсчёт…", RUNNING: "Печ
 
 
 ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+
+log = logging.getLogger("autoprint")
 
 
 def make_icon_pixmap(color: str, size: int = 64) -> QPixmap:
@@ -118,10 +122,26 @@ class MainWindow(QMainWindow):
         self._save_timer.setInterval(700)
         self._save_timer.timeout.connect(self._save_store)
 
+        self.updates = UpdateManager(settings, self)
+        self.updates.checked.connect(self._on_update_checked)
+        self.updates.check_failed.connect(self._on_update_check_failed)
+        self.updates.ready.connect(self._on_update_ready)
+        self.updates.download_failed.connect(lambda t: log.warning("Обновление не скачано: %s", t))
+        self.relaunch_requested = False   # app.py перезапустит программу после выхода
+        self._auto_checked_once = False
+
         self._build_ui()
         self._build_tray()
         self._apply_settings()
         self._restore_session()
+
+        # автопроверка: вскоре после запуска, затем раз в час смотрим, не пора ли
+        QTimer.singleShot(8000, self._auto_check_updates)
+        self._update_timer = QTimer(self)
+        self._update_timer.setInterval(3600 * 1000)
+        self._update_timer.timeout.connect(self._auto_check_updates)
+        self._update_timer.start()
+        QTimer.singleShot(1500, self._show_update_result)
 
     # ================================================================ UI
     def _build_ui(self) -> None:
@@ -160,6 +180,13 @@ class MainWindow(QMainWindow):
         self.btn_sound.setToolTip("Звук клавиш")
         self.btn_sound.toggled.connect(self._on_sound_toggle)
         bar.addWidget(self.btn_sound)
+        self.vol = QSlider(Qt.Orientation.Horizontal)
+        self.vol.setRange(0, 100)
+        self.vol.setFixedWidth(110)
+        self.vol.setToolTip("Громкость клавиш")
+        self.vol.valueChanged.connect(self._on_volume)
+        self.vol.sliderReleased.connect(self._on_volume_released)
+        bar.addWidget(self.vol)
         bar.addStretch(1)
         btn_settings = QPushButton("⚙ Настройки")
         btn_settings.clicked.connect(self.open_settings)
@@ -257,6 +284,16 @@ class MainWindow(QMainWindow):
         m.addAction("Ctrl/Shift + колёсико — масштаб блока под мышью").setEnabled(False)
         m = self.menuBar().addMenu("Справка")
         self._act(m, "Как пользоваться", self.show_help, "F1")
+        m.addSeparator()
+        self._act(m, "Проверить обновления…", lambda: self.check_updates(manual=True))
+        self._act(m, "О программе", self.show_about)
+
+        self.btn_update = QToolButton()
+        self.btn_update.setAutoRaise(True)
+        self.btn_update.setStyleSheet("QToolButton { color: #2da44e; font-weight: bold; }")
+        self.btn_update.clicked.connect(self.open_update_dialog)
+        self.btn_update.hide()
+        self.statusBar().addPermanentWidget(self.btn_update)
 
         QShortcut(QKeySequence("Ctrl+Tab"), self, lambda: self.cmd_next_tab(+1))
         QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, lambda: self.cmd_next_tab(-1))
@@ -296,6 +333,8 @@ class MainWindow(QMainWindow):
         menu.addAction("Старт / пауза", lambda: self.cmd_toggle(from_button=False, countdown=3))
         menu.addAction("Стоп", self.cmd_stop)
         menu.addSeparator()
+        self.tray_update = menu.addAction("Обновление…", self.open_update_dialog)
+        self.tray_update.setVisible(False)
         menu.addAction("Выход", self.quit_app)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda r: self._show_window()
@@ -316,6 +355,10 @@ class MainWindow(QMainWindow):
         self.btn_sound.setChecked(s.sound_enabled)
         self.btn_sound.setText("🔊" if s.sound_enabled else "🔇")
         self.btn_sound.blockSignals(False)
+        self.vol.blockSignals(True)
+        self.vol.setValue(s.sound_volume)
+        self.vol.setEnabled(s.sound_enabled)
+        self.vol.blockSignals(False)
         self.act_strip.setChecked(s.strip_comments)
         self.act_human.setChecked(s.human_typing)
         self.player.enabled = s.sound_enabled
@@ -355,12 +398,27 @@ class MainWindow(QMainWindow):
         self.settings.sound_enabled = on
         self.player.enabled = on
         self.btn_sound.setText("🔊" if on else "🔇")
+        self.vol.setEnabled(on)
         self._save_settings()
+
+    def _on_volume(self, v: int) -> None:
+        self.settings.sound_volume = v
+        self.player.set_volume(v)
+        self.vol.setToolTip(f"Громкость клавиш: {v}%")
+        if not self.vol.isSliderDown():   # колёсико / клавиши — сразу, перетаскивание — по отпусканию
+            self._on_volume_released()
+
+    def _on_volume_released(self) -> None:
+        self._save_settings()
+        if self.engine.state != RUNNING:   # услышать новую громкость
+            for i, kind in enumerate(("key", "key", "space")):
+                QTimer.singleShot(i * 120, lambda k=kind: self.player.play(k))
 
     def open_settings(self) -> None:
         self.hotkeys.set_bindings({})  # иначе QKeySequenceEdit не увидит уже занятые сочетания
         dlg = SettingsDialog(self.settings, self)
         dlg.test_sound.connect(self._test_sound)
+        dlg.check_updates.connect(lambda: self.check_updates(manual=True))
         if dlg.exec() and dlg.result_settings:
             new = dlg.result_settings
             for k, v in asdict(new).items():
@@ -890,7 +948,115 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._apply_taskbar)
         return super().event(e)
 
+    # ================================================================ обновления
+    def _busy_typing(self) -> bool:
+        return self.engine.state in (RUNNING, COUNTDOWN, PAUSED)
+
+    def _auto_check_updates(self) -> None:
+        # «при каждом запуске» — только первая проверка; иначе таймер раз в час смотрит, не пора ли
+        if self._auto_checked_once and self.settings.update_interval_h <= 0:
+            return
+        self._auto_checked_once = True
+        if self.updates.check_due():
+            self.updates.check(manual=False)
+
+    def check_updates(self, manual: bool = True) -> None:
+        if manual:
+            self.statusBar().showMessage("Проверка обновлений…", 5000)
+        self.updates.check(manual)
+
+    def _on_update_checked(self, rel, manual: bool) -> None:
+        self.settings.update_last_check = time.time()
+        self._save_settings()
+        if rel is None:
+            self._show_update_button(None)
+            if manual:
+                QMessageBox.information(QApplication.activeModalWidget() or self, "Обновления",
+                                        f"У вас последняя версия — {__version__}.")
+            return
+        if not manual and self.updates.is_skipped(rel):
+            return
+        self._show_update_button(rel)
+        if manual:
+            self.open_update_dialog()
+        elif self.settings.update_mode in (MODE_DOWNLOAD, MODE_AUTO) and self.updates.can_install:
+            self.updates.download(rel)   # сообщим, когда будет готово
+        elif not self._busy_typing():
+            self._notify(f"Доступна новая версия {rel.version}. Нажмите «⬆» в строке состояния.", tray=True)
+
+    def _on_update_check_failed(self, text: str, manual: bool) -> None:
+        if manual:
+            QMessageBox.warning(QApplication.activeModalWidget() or self, "Обновления", text)
+
+    def _on_update_ready(self, rel) -> None:
+        self._show_update_button(rel)
+        if self.settings.update_mode == MODE_AUTO:
+            text = f"Версия {rel.version} скачана и установится при выходе из программы."
+        else:
+            text = f"Версия {rel.version} готова к установке — нажмите «⬆» в строке состояния."
+        if self._busy_typing():   # не отвлекаем во время занятия
+            log.info(text)
+        else:
+            self._notify(text, tray=True)
+
+    def _show_update_button(self, rel) -> None:
+        if rel is None:
+            self.btn_update.hide()
+            self.tray_update.setVisible(False)
+            return
+        ready = bool(self.updates.staged and self.updates.staged[0].version == rel.version)
+        text = f"⬆ Обновить до {rel.version}" if ready else f"⬆ Доступна версия {rel.version}"
+        self.btn_update.setText(text)
+        self.btn_update.setToolTip("Что нового и установка")
+        self.btn_update.show()
+        self.tray_update.setText(text)
+        self.tray_update.setVisible(True)
+
+    def open_update_dialog(self) -> None:
+        rel = self.updates.latest
+        if rel is None:
+            self.check_updates(manual=True)
+            return
+        dlg = UpdateDialog(self.updates, rel, QApplication.activeModalWidget() or self)
+        dlg.restart_requested.connect(self.install_update_and_restart)
+        dlg.exec()
+
+    def install_update_and_restart(self) -> None:
+        if self._busy_typing():
+            if QMessageBox.question(self, "Обновление", "Сейчас идёт печать. Остановить её и перезапустить "
+                                    "программу с новой версией?") != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            ver = self.updates.apply_staged()
+        except updater.UpdateError as e:
+            QMessageBox.warning(self, "Обновление", str(e))
+            return
+        log.info("Перезапуск после обновления до %s", ver)
+        self._restart()
+
+    def _restart(self) -> None:
+        self.engine.stop()
+        self.relaunch_requested = True
+        QTimer.singleShot(0, self.quit_app)
+
+    def _show_update_result(self) -> None:
+        d = updater.pop_last_update()
+        if not d:
+            return
+        self._notify(f"{APP_NAME} обновлён: {d.get('from')} → {d.get('to')}.", tray=True)
+
+    def show_about(self) -> None:
+        QMessageBox.about(self, "О программе", f"<h3>{APP_NAME} {__version__}</h3>"
+                          "<p>Агент для живых демонстраций кода.</p>")
+
     def closeEvent(self, e) -> None:
+        # «установить при выходе»: скачанное обновление применяется, новая версия — со следующего запуска
+        if (self.updates.staged and not self.updates.applied and not self.relaunch_requested
+                and self.settings.update_mode == MODE_AUTO):
+            try:
+                self.updates.apply_staged()
+            except updater.UpdateError as err:
+                log.warning("Обновление при выходе не установлено: %s", err)
         self.engine.stop()
         self._save_timer.stop()
         self._save_store()

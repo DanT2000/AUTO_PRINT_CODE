@@ -27,7 +27,8 @@ def main() -> int:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(DATA_DIR / ".lock"))
-    if not lock.tryLock(100):
+    # после обновления старый экземпляр может ещё завершаться — подождём его
+    if not lock.tryLock(15000 if "--updated" in sys.argv else 100):
         QMessageBox.information(None, APP_NAME, "AutoPrintCode уже запущен (ищите значок в трее).")
         return 0
 
@@ -56,6 +57,9 @@ def main() -> int:
     win.show()
     code = app.exec()
     lock.unlock()
+    if win.relaunch_requested:   # обновление или откат: запустить уже новую версию
+        from autoprint import updater
+        updater.relaunch()
     return code
 
 

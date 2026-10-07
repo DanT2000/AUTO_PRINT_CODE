@@ -48,6 +48,10 @@ PROFILES = {
 }
 
 
+# звуки до v0.3.8 были синтезированы; теперь — записи настоящих клавиатур
+LEGACY_SOUND_STYLES = {"soft": "office", "mechanical": "brown", "typewriter": "blue"}
+
+
 @dataclass
 class Settings:
     hotkey_toggle: str = "Ctrl+F9"     # старт / пауза / продолжить
@@ -76,7 +80,7 @@ class Settings:
 
     sound_enabled: bool = True
     sound_volume: int = 35             # 0..100
-    sound_style: str = "soft"          # soft | mechanical | typewriter
+    sound_style: str = "office"        # office | brown | red | cream | blue (см. sounds.STYLES)
 
     hotkey_start_delay_ms: int = 150   # пауза перед стартом по хоткею
     button_countdown_s: int = 3        # отсчёт при старте кнопкой в окне
@@ -85,6 +89,13 @@ class Settings:
     guard_enabled: bool = True         # пауза при нажатии клавиши / клике во время печати
     auto_advance: bool = False         # по окончании выбрать следующий блок кода
     always_on_top: bool = False
+
+    update_auto_check: bool = True     # проверять обновления на GitHub сам
+    update_interval_h: int = 24        # как часто: 0 — при каждом запуске, 24 — раз в день, 168 — раз в неделю
+    update_mode: str = "download"      # notify — сообщить | download — скачать и предложить | auto — ставить при выходе
+    update_prerelease: bool = False    # предлагать бета-версии
+    update_skip_version: str = ""      # «пропустить эту версию»
+    update_last_check: float = 0.0
 
     open_tabs: list = field(default_factory=list)
     current_tab: str = ""
@@ -102,6 +113,7 @@ class Settings:
         for k, v in raw.items():
             if k in known and type(v) is type(getattr(s, k)):
                 setattr(s, k, v)
+        s.sound_style = LEGACY_SOUND_STYLES.get(s.sound_style, s.sound_style)
         return s
 
     def save(self) -> None:
