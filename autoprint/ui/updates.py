@@ -1,6 +1,11 @@
-"""Обновления в интерфейсе: фоновая проверка и загрузка, окно «Доступно обновление»."""
+"""Обновления в интерфейсе: фоновая проверка и загрузка, окно «Доступно обновление».
+
+Собранная программа (.exe) ставит сборку из релиза: скачивание, проверка SHA-256 и распаковка — здесь,
+в фоне; замену файлов делает скрипт после выхода программы (см. updater.prepare_exe_update / relaunch).
+"""
 from __future__ import annotations
 
+import html
 import logging
 import threading
 import time
@@ -48,7 +53,22 @@ class UpdateManager(QObject):
 
     @property
     def can_install(self) -> bool:
-        return self.mode != MODE_FROZEN
+        """Можно ли поставить найденную версию (self.latest) самой программой, без браузера."""
+        if self.mode != MODE_FROZEN:
+            return True
+        if self.latest is None:
+            return updater.can_self_update()
+        return self.installable(self.latest)
+
+    def installable(self, rel: Release) -> bool:
+        """Собранной программе нужна сборка .exe с .sha256 в релизе и право записи в свою папку."""
+        return self.mode != MODE_FROZEN or updater.frozen_block_reason(rel) is None
+
+    def block_reason(self, rel: Release) -> str:
+        """Почему rel придётся скачать вручную ('' — не придётся)."""
+        if self.mode != MODE_FROZEN:
+            return ""
+        return updater.frozen_block_reason(rel) or ""
 
     # ---- проверка
     def check_due(self) -> bool:
@@ -90,7 +110,7 @@ class UpdateManager(QObject):
 
     # ---- загрузка
     def download(self, rel: Release) -> None:
-        if self.downloading or not self.can_install:
+        if self.downloading or not self.installable(rel):
             return
         if self.staged and self.staged[0].version == rel.version:
             self.ready.emit(rel)
@@ -104,7 +124,13 @@ class UpdateManager(QObject):
 
     def _download(self, rel: Release) -> None:
         try:
-            if self.mode == MODE_GIT:
+            if self.mode == MODE_FROZEN:
+                # сборка .exe: скачать, сверить SHA-256 с .sha256 из релиза, распаковать и проверить
+                z = updater.download_exe(rel, lambda got, total: self.progress.emit("Загрузка", got, total),
+                                         lambda: self._cancel)
+                self.progress.emit("Распаковка", 0, 0)
+                root = updater.stage_exe(z, rel)
+            elif self.mode == MODE_GIT:
                 self.progress.emit("Загрузка", 0, 0)
                 root = updater.git_stage(rel)
             else:
@@ -112,7 +138,7 @@ class UpdateManager(QObject):
                                      lambda: self._cancel)
                 self.progress.emit("Проверка архива", 0, 0)
                 root = updater.stage(z, rel)
-            if updater.requirements_changed(root):
+            if self.mode != MODE_FROZEN and updater.requirements_changed(root):
                 self.progress.emit("Установка библиотек (pip)", 0, 0)
                 updater.install_requirements(root)
         except UpdateError as e:
@@ -130,13 +156,17 @@ class UpdateManager(QObject):
 
     # ---- установка
     def apply_staged(self) -> str:
-        """Ставит скачанное обновление. Возвращает новую версию. UpdateError — если не вышло."""
+        """Ставит скачанное обновление. Возвращает новую версию. UpdateError — если не вышло.
+        Собранная программа здесь только готовит скрипт: файлы он заменит после выхода из программы
+        (updater.relaunch() — с перезапуском, обычный выход — без него)."""
         if not self.staged:
             raise UpdateError("Обновление ещё не скачано.")
         if self.applied:
             return self.staged[0].version
         rel, root = self.staged
-        if self.mode == MODE_GIT:
+        if self.mode == MODE_FROZEN:
+            updater.prepare_exe_update(root, rel.version)
+        elif self.mode == MODE_GIT:
             updater.git_apply(rel)
         else:
             updater.apply(root, rel.version)
@@ -170,6 +200,7 @@ class UpdateDialog(QDialog):
         self.status = QLabel()
         self.status.setWordWrap(True)
         self.status.setTextFormat(Qt.TextFormat.RichText)
+        self.status.setOpenExternalLinks(True)
         self.bar = QProgressBar()
         self.bar.hide()
         self._want_restart = False
@@ -202,12 +233,17 @@ class UpdateDialog(QDialog):
 
     def _refresh(self) -> None:
         m = self.m
-        if m.mode == MODE_FROZEN:
+        if not m.installable(self.rel):
             self.btn_install.setText("Скачать…")
-            self.status.setText(FROZEN_NOTE)
+            self.status.setText(html.escape(m.block_reason(self.rel) or FROZEN_NOTE))
         elif m.staged and m.staged[0].version == self.rel.version:
             self.btn_install.setText("Перезапустить и обновить")
-            self.status.setText("Обновление скачано и проверено. Ваши образцы и настройки не изменятся.")
+            if m.mode == MODE_FROZEN:
+                self.status.setText("Обновление скачано, контрольная сумма совпала. Программа закроется "
+                                    "на несколько секунд и откроется уже новой версией. "
+                                    "Ваши образцы и настройки не изменятся.")
+            else:
+                self.status.setText("Обновление скачано и проверено. Ваши образцы и настройки не изменятся.")
         elif m.downloading:
             self.btn_install.setText("Отменить загрузку")
             self.bar.show()
@@ -217,7 +253,7 @@ class UpdateDialog(QDialog):
 
     def _install(self) -> None:
         m = self.m
-        if m.mode == MODE_FROZEN:
+        if not m.installable(self.rel):
             QDesktopServices.openUrl(QUrl(self.rel.page_url))
             self.accept()
         elif m.downloading:
@@ -255,7 +291,11 @@ class UpdateDialog(QDialog):
         self.bar.hide()
         self._want_restart = False
         self._refresh()
-        self.status.setText(f"<span style='color:#e5534b'>{text}</span>")
+        msg = f"<span style='color:#e5534b'>{html.escape(text)}</span>"
+        if self.m.mode == MODE_FROZEN:   # всегда остаётся ручной путь — страница релиза
+            msg += (f"<br>Новую версию можно скачать и вручную: "
+                    f"<a href='{html.escape(self.rel.page_url, quote=True)}'>страница релиза</a>.")
+        self.status.setText(msg)
 
     def done(self, r: int) -> None:
         for sig, slot in ((self.m.progress, self._on_progress), (self.m.ready, self._on_ready),

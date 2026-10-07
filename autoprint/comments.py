@@ -9,6 +9,7 @@ Shebang «#!» и строка кодировки в начале файла с�
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 _HASH = ("#",)
 _SLASH = ("//",)
@@ -37,39 +38,76 @@ def supported(lang: str) -> bool:
     return (lang or "").lower() in _LANGS
 
 
+def comment_spans(text: str, lang: str) -> list[tuple[int, int]]:
+    """Отрезки [начало, конец) комментариев в тексте (строки-литералы не трогаются)."""
+    spec = _LANGS.get((lang or "").lower())
+    return _comment_spans(text, *spec) if spec else []
+
+
+_MARKS = re.compile(r"^\s*(?:#+|//+|/\*+|<!--|--)\s?|\s*(?:\*+/|-->)\s*$")
+
+
+def comment_text(raw: str) -> str:
+    """Текст комментария без значков: «# Шаг 2. Считаем» → «Шаг 2. Считаем». Для суфлёра."""
+    lines = []
+    for ln in raw.split("\n"):
+        ln = _MARKS.sub("", ln)
+        ln = re.sub(r"^\s*\*\s?", "", ln)   # « * » в начале строк многострочного /* … */
+        lines.append(ln.rstrip())
+    return "\n".join(lines).strip()
+
+
+@lru_cache(maxsize=None)
+def _scanner(line_marks: tuple, blocks: tuple, quotes: tuple):
+    """Регулярные выражения разбора: ближайшее «интересное» место (кавычка, начало блочного или строчного
+    комментария — в этом порядке, как и проверялось бы посимвольно) и конец строки-литерала для каждой кавычки.
+    Посимвольный цикл на Python для блока в 500 строк занимал десятки миллисекунд на каждое нажатие клавиши."""
+    starts = [("q", q) for q in quotes] + [("b", b[0]) for b in blocks] + [("l", m) for m in line_marks]
+    if not starts:
+        return None, {}
+    head = re.compile("|".join(f"(?P<{kind}{k}>{re.escape(s)})" for k, (kind, s) in enumerate(starts)))
+    ends = {q: re.compile(r"\\|" + re.escape(q) + (r"|\n" if len(q) == 1 else "")) for q in quotes}
+    return head, ends
+
+
 def _comment_spans(text: str, line_marks: tuple, blocks: tuple, quotes: tuple) -> list[tuple[int, int]]:
     spans = []
     i, n = 0, len(text)
+    head, ends = _scanner(line_marks, blocks, quotes)
+    if head is None:
+        return spans
     while i < n:
-        q = next((q for q in quotes if text.startswith(q, i)), None)
-        if q:
-            j = i + len(q)
-            while j < n:
-                if text[j] == "\\":
-                    j += 2
+        m = head.search(text, i)
+        if not m:
+            break
+        i = m.start()
+        tok = m.group()
+        kind = m.lastgroup[0]
+        if kind == "q":
+            rx, j = ends[tok], m.end()
+            while True:
+                e = rx.search(text, j)
+                if not e:
+                    j = n
+                    break
+                s = e.group()
+                if s == "\\":
+                    j = e.start() + 2
                     continue
-                if text.startswith(q, j):
-                    j += len(q)
-                    break
-                if len(q) == 1 and text[j] == "\n":   # незакрытая строка — до конца строки
-                    break
-                j += 1
+                j = e.start() if s == "\n" else e.end()   # незакрытая строка — до конца строки
+                break
             i = j
-            continue
-        b = next((b for b in blocks if text.startswith(b[0], i)), None)
-        if b:
-            end = text.find(b[1], i + len(b[0]))
-            end = n if end < 0 else end + len(b[1])
+        elif kind == "b":
+            close = next(b[1] for b in blocks if b[0] == tok)
+            end = text.find(close, m.end())
+            end = n if end < 0 else end + len(close)
             spans.append((i, end))
             i = end
-            continue
-        if any(text.startswith(m, i) for m in line_marks):
+        else:
             end = text.find("\n", i)
             end = n if end < 0 else end
             spans.append((i, end))
             i = end
-            continue
-        i += 1
     return spans
 
 

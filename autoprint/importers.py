@@ -25,8 +25,12 @@ def _build(title: str, cells: list[tuple], lang: str) -> Template:
         if not text.strip():
             continue
         m = meta[0] if meta else {}
+        try:   # шаги строк (печать по шагам) — из нашей же тетрадки, если её экспортировали отсюда
+            steps = [max(1, int(s)) for s in m.get("steps") or []]
+        except (TypeError, ValueError):
+            steps = []
         blocks.append(Block(BLOCK_MARKDOWN if kind == "markdown" else BLOCK_CODE, text, lang=lang,
-                            role=m.get("role", "text"), title=m.get("title", "")))
+                            role=m.get("role", "text"), title=m.get("title", ""), steps=steps))
     return Template(title=title, blocks=blocks)
 
 
@@ -121,7 +125,10 @@ def export_ipynb(t: Template, path: str) -> None:
                           "metadata": {"autoprintcode": {"role": b.role, "title": b.title}}})
         else:
             lang = b.lang or lang
-            cells.append({"cell_type": "code", "metadata": {"autoprintcode": {"title": b.title}},
+            meta = {"title": b.title}
+            if b.steps:   # разметка шагов переживает экспорт и импорт обратно
+                meta["steps"] = list(b.steps)
+            cells.append({"cell_type": "code", "metadata": {"autoprintcode": meta},
                           "execution_count": None,
                           "outputs": [], "source": src(b.text)})
     nb = {"cells": cells, "nbformat": 4, "nbformat_minor": 5,

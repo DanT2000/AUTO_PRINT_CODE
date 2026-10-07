@@ -1,8 +1,10 @@
 """Подсветка синтаксиса для редактора образца (Pygments → QSyntaxHighlighter)."""
 from __future__ import annotations
 
+import weakref
 from bisect import bisect_right
 
+import shiboken6
 from pygments import lex
 from pygments.lexers import get_lexer_by_name
 from pygments.lexers.special import TextLexer
@@ -13,26 +15,35 @@ from PySide6.QtGui import QColor, QFont, QSyntaxHighlighter, QTextCharFormat
 LANGUAGES = ["python", "javascript", "typescript", "html", "css", "sql", "java", "c", "cpp",
              "csharp", "go", "rust", "php", "bash", "powershell", "json", "yaml", "markdown", "text"]
 
-# Тёмная тема в духе One Dark — редактор образца всегда тёмный, как в IDE.
-EDITOR_BG = "#1e2229"
-EDITOR_FG = "#d7dae0"
-EDITOR_LINE = "#2a2f38"
-EDITOR_SEL = "#264f78"
-EDITOR_GUTTER = "#5c6370"
-
-_STYLE = [
-    (Comment, "#7f848e", False, True),
-    (Keyword, "#c678dd", False, False),
-    (Name.Builtin, "#56b6c2", False, False),
-    (Name.Function, "#61afef", False, False),
-    (Name.Class, "#e5c07b", True, False),
-    (Name.Decorator, "#e5c07b", False, False),
-    (Name.Tag, "#e06c75", False, False),
-    (Name.Attribute, "#d19a66", False, False),
-    (String, "#98c379", False, False),
-    (Number, "#d19a66", False, False),
-    (Operator, "#56b6c2", False, False),
-]
+# Цвета подсветки под тему оформления (тёплый янтарь PasteTalk + спокойные холодные тона)
+PALETTES = {
+    "dark": [
+        (Comment, "#6E6E7A", False, True),
+        (Keyword, "#F0B54A", False, False),
+        (Name.Builtin, "#6FC3DF", False, False),
+        (Name.Function, "#7FB4FF", False, False),
+        (Name.Class, "#F2CC60", True, False),
+        (Name.Decorator, "#F2CC60", False, False),
+        (Name.Tag, "#F2686C", False, False),
+        (Name.Attribute, "#E8A87C", False, False),
+        (String, "#9CD67C", False, False),
+        (Number, "#D2A8FF", False, False),
+        (Operator, "#A6A6B2", False, False),
+    ],
+    "light": [
+        (Comment, "#8A8A96", False, True),
+        (Keyword, "#A35F00", False, False),
+        (Name.Builtin, "#0F7A99", False, False),
+        (Name.Function, "#1F5FBF", False, False),
+        (Name.Class, "#8A5A00", True, False),
+        (Name.Decorator, "#8A5A00", False, False),
+        (Name.Tag, "#C0272D", False, False),
+        (Name.Attribute, "#A0522D", False, False),
+        (String, "#237A32", False, False),
+        (Number, "#7A3DB8", False, False),
+        (Operator, "#5A5A66", False, False),
+    ],
+}
 
 
 def _fmt(color: str, bold: bool, italic: bool) -> QTextCharFormat:
@@ -44,7 +55,24 @@ def _fmt(color: str, bold: bool, italic: bool) -> QTextCharFormat:
     return f
 
 
-_FORMATS = [(tt, _fmt(c, b, i)) for tt, c, b, i in _STYLE]
+_FORMATS: list = []
+_live: "weakref.WeakSet[CodeHighlighter]" = weakref.WeakSet()
+
+
+def set_palette(name: str) -> None:
+    """Сменить цвета подсветки во всех открытых редакторах (при смене темы)."""
+    global _FORMATS
+    _FORMATS = [(tt, _fmt(c, b, i)) for tt, c, b, i in PALETTES.get(name, PALETTES["dark"])]
+    for h in list(_live):
+        # редактор удалён (блок убран, образец закрыт), а обёртка Python ещё жива — пропускаем
+        doc = h.document() if shiboken6.isValid(h) else None
+        if doc is None or not shiboken6.isValid(doc):
+            _live.discard(h)
+            continue
+        h._refresh()
+
+
+set_palette("dark")
 
 
 def _format_for(ttype) -> QTextCharFormat | None:
@@ -59,6 +87,7 @@ def _format_for(ttype) -> QTextCharFormat | None:
 class CodeHighlighter(QSyntaxHighlighter):
     def __init__(self, document, lang: str = "python") -> None:
         super().__init__(document)
+        _live.add(self)
         self._starts: list[int] = []
         self._spans: list[tuple[int, int, QTextCharFormat]] = []
         self._lexer = TextLexer()

@@ -1,29 +1,51 @@
 """Виджеты блоков образца: текстовый (Markdown) и код."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QTextCursor
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QMenu, QSizePolicy, QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout)
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QIcon, QPainter, QTextCursor
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QLineEdit, QMenu,
+                               QPlainTextEdit, QSizePolicy, QStackedWidget, QStyle, QStyleOptionComboBox,
+                               QStylePainter, QTextBrowser, QToolButton, QVBoxLayout)
 
 from ..highlighter import LANGUAGES
 from ..storage import BLOCK_CODE, BLOCK_MARKDOWN, ROLES, Block
+from . import icons
 from .code_editor import CodeEditor, code_font
+from .theme import css, mix, theme
+from .widgets import IconButton, repolish
 
-ARMED_COLOR = "#2ea043"
 ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 50, 300, 10
 
-
-def _tool(text: str, tip: str) -> QToolButton:
-    b = QToolButton()
-    b.setText(text)
-    b.setToolTip(tip)
-    b.setAutoRaise(True)
-    return b
-
-
 CODE_TYPE = "code"
-TYPE_ITEMS = [(f"{icon} {name}", key) for key, (icon, name, _c) in ROLES.items()] + [("💻 Код", CODE_TYPE)]
+ROLE_ICONS = {"text": "text", "task": "file-text", "explain": "info", "hint": "help"}
+TYPE_ITEMS = [(name, key, ROLE_ICONS.get(key, "text"), f"role_{key}") for key, (_i, name, _c) in ROLES.items()] \
+    + [("Код", CODE_TYPE, "code", "accent")]
+
+
+class IconCombo(QComboBox):
+    """Тип блока: в шапке — только значок, в раскрытом списке — значок и название."""
+
+    def paintEvent(self, e) -> None:
+        p = QStylePainter(self)
+        opt = QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        opt.currentText = ""
+        opt.currentIcon = QIcon()
+        p.drawComplexControl(QStyle.ComplexControl.CC_ComboBox, opt)
+        ic = self.itemIcon(self.currentIndex())
+        if not ic.isNull():
+            s = self.iconSize()
+            p.drawPixmap(8, (self.height() - s.height()) // 2, ic.pixmap(s))
+
+    def sizeHint(self) -> QSize:
+        return QSize(50, 26)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(50, 26)
+
+    def showPopup(self) -> None:
+        self.view().setMinimumWidth(180)
+        super().showPopup()
 
 
 class BlockWidget(QFrame):
@@ -32,67 +54,97 @@ class BlockWidget(QFrame):
     delete_requested = Signal(object)
     type_requested = Signal(object, str)          # (виджет, роль | "code")
     insert_requested = Signal(object, int, str)   # (виджет, 0 — выше | 1 — ниже, тип нового блока)
-    zoom_changed = Signal(int)                    # новый масштаб блока, % — для строки состояния
+    zoom_changed = Signal(int)                    # новый масштаб блока, % — для сообщения
 
     def __init__(self, block: Block, code_number: int = 0) -> None:
         super().__init__()
         self.block = block
         self.code_number = code_number
         self.setObjectName("block")
-        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setProperty("armed", False)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(8, 6, 8, 8)
-        lay.setSpacing(4)
+        lay.setContentsMargins(12, 8, 10, 12)
+        lay.setSpacing(8)
 
         # шапка: [тип][заголовок][доп. слева] … [доп. справа][＋↑][＋↓][↑][↓][✕]
         self.header = QHBoxLayout()
         self.header.setSpacing(4)
-        self.kind = QComboBox()
-        self.kind.setToolTip("Тип блока")
-        for label, key in TYPE_ITEMS:
-            self.kind.addItem(label, key)
+        self.kind = IconCombo()
+        self.kind.setObjectName("kindCombo")
+        self.kind.setIconSize(QSize(15, 15))
+        self.kind.setToolTip("Тип блока: текст, условие, пояснение, подсказка или код")
+        for text, key, _ic, _tok in TYPE_ITEMS:
+            self.kind.addItem(text, key)
         self.kind.setCurrentIndex(self.kind.findData(CODE_TYPE if block.type == BLOCK_CODE else block.role))
         self.kind.activated.connect(self._on_kind)
         self.header.addWidget(self.kind)
 
         self.title = QLineEdit(block.title)
-        self.title.setFrame(False)
+        self.title.setObjectName("blockTitle")
         self.title.setToolTip("Заголовок блока — щёлкните, чтобы изменить")
-        f = self.title.font()
-        f.setBold(True)
-        self.title.setFont(f)
-        self.title.setMinimumWidth(120)
+        self.title.setMinimumWidth(80)
         self.title.setMaximumWidth(320)
-        self.title.setStyleSheet("QLineEdit { background: transparent; }")
         self.title.textEdited.connect(self._on_title)
         self.header.addWidget(self.title)
         self._update_placeholder()
 
         self.left_slot = QHBoxLayout()
+        self.left_slot.setSpacing(8)
         self.header.addLayout(self.left_slot)
         self.header.addStretch(1)
         self.right_slot = QHBoxLayout()
+        self.right_slot.setSpacing(4)
         self.header.addLayout(self.right_slot)
+        self.header.addSpacing(4)
 
-        for text, tip, after in (("＋↑", "Вставить блок выше", 0), ("＋↓", "Вставить блок ниже", 1)):
-            b = _tool(text, tip)
+        self._insert_actions = []
+        for name, tip, after in (("insert-above", "Вставить блок выше", 0), ("insert-below", "Вставить блок ниже", 1)):
+            b = IconButton(name, tip, 15, box=26)
             m = QMenu(b)
-            m.addAction("📝 Текст (Markdown)", lambda a=after: self.insert_requested.emit(self, a, BLOCK_MARKDOWN))
-            m.addAction("💻 Блок кода", lambda a=after: self.insert_requested.emit(self, a, BLOCK_CODE))
+            self._insert_actions += [
+                (m.addAction("Текст (Markdown)", lambda a=after: self.insert_requested.emit(self, a, BLOCK_MARKDOWN)),
+                 "text"),
+                (m.addAction("Блок кода", lambda a=after: self.insert_requested.emit(self, a, BLOCK_CODE)), "code")]
             b.setMenu(m)
             b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
             self.header.addWidget(b)
 
-        for text, tip, slot in (("↑", "Блок выше", lambda: self.move_requested.emit(self, -1)),
-                                ("↓", "Блок ниже", lambda: self.move_requested.emit(self, +1)),
-                                ("✕", "Удалить блок", lambda: self.delete_requested.emit(self))):
-            b = _tool(text, tip)
+        for name, tip, slot in (("arrow-up", "Блок выше", lambda: self.move_requested.emit(self, -1)),
+                                ("arrow-down", "Блок ниже", lambda: self.move_requested.emit(self, +1)),
+                                ("trash", "Удалить блок", lambda: self.delete_requested.emit(self))):
+            b = IconButton(name, tip, 15, box=26)
             b.clicked.connect(slot)
             self.header.addWidget(b)
         lay.addLayout(self.header)
         self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 0, 0, 0)
         lay.addLayout(self.body)
-        self._apply_role_style()
+        self._refresh_kind_icons()
+        theme.changed.connect(self._refresh_kind_icons)
+
+    def _refresh_kind_icons(self) -> None:
+        for i, (_t, _k, ic, tok) in enumerate(TYPE_ITEMS):
+            self.kind.setItemIcon(i, icons.icon(ic, tok, 14))
+        for action, ic in self._insert_actions:
+            action.setIcon(icons.icon(ic))
+        self.update()
+
+    def role_token(self) -> str:
+        if self.block.type == BLOCK_CODE:
+            return "accent"
+        # роль приходит и из импорта (.ipynb, .json) — незнакомая рисуется как обычный текст
+        return f"role_{self.block.role}" if self.block.role in ROLES else "role_text"
+
+    def paintEvent(self, e) -> None:
+        super().paintEvent(e)
+        if self.block.type != BLOCK_CODE:
+            # цветная черта роли слева, как отметка выбранного пункта в PasteTalk
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(theme.c(self.role_token()))
+            p.drawRoundedRect(QRectF(1, 12, 3, self.height() - 24), 1.5, 1.5)
+            p.end()
 
     def zoom_by(self, steps: int) -> None:
         self.apply_zoom(self.block.zoom + steps * ZOOM_STEP)
@@ -123,30 +175,35 @@ class BlockWidget(QFrame):
         if key != current:
             self.type_requested.emit(self, key)
 
-    def _apply_role_style(self) -> None:
-        if self.block.type != BLOCK_CODE:
-            color = ROLES.get(self.block.role, ROLES["text"])[2]
-            self.setStyleSheet(f"QFrame#block {{ border-left: 4px solid {color}; }}")
-
 
 # ------------------------------------------------------------------ Markdown
 
 class _AutoBrowser(QTextBrowser):
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("mdView")
         self.setOpenExternalLinks(True)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.document().setDocumentMargin(4)
+        self.viewport().setAutoFillBackground(False)
+        self.document().setDocumentMargin(2)
 
     def fit(self) -> None:
         self.document().setTextWidth(self.viewport().width())
-        self.setFixedHeight(max(30, int(self.document().size().height()) + 6))
+        self.setFixedHeight(max(26, int(self.document().size().height()) + 4))
 
     def resizeEvent(self, e) -> None:
         super().resizeEvent(e)
         self.fit()
+
+
+def _markdown_css() -> str:
+    code_bg = mix(theme.c("card"), theme.c("text"), 0.08).name()
+    return (f'code {{ font-family: "{theme.mono_family}"; background-color: {code_bg}; }}'
+            f'pre {{ font-family: "{theme.mono_family}"; background-color: {code_bg}; }}'
+            f'a {{ color: {theme.c("accent").name()}; }}'
+            f'h1, h2, h3 {{ font-family: "{theme.display_family}"; }}')
 
 
 class MarkdownBlockWidget(BlockWidget):
@@ -154,7 +211,12 @@ class MarkdownBlockWidget(BlockWidget):
 
     def __init__(self, block: Block) -> None:
         super().__init__(block)
-        self.toggle = _tool("✎ Править", "Переключить: просмотр / редактирование Markdown")
+        self.toggle = QToolButton()
+        self.toggle.setObjectName("textBtn")
+        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle.setIconSize(QSize(14, 14))
+        self.toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.toggle.setToolTip("Переключить: просмотр / редактирование Markdown")
         self.toggle.clicked.connect(self.toggle_mode)
         self.right_slot.addWidget(self.toggle)
 
@@ -162,14 +224,21 @@ class MarkdownBlockWidget(BlockWidget):
         self.view = _AutoBrowser()
         self.view.viewport().installEventFilter(self)
         self.edit = QPlainTextEdit(block.text)
+        self.edit.setObjectName("mdEdit")
         self.edit.setFont(code_font(10))
         self.edit.setPlaceholderText("Текст в формате Markdown: условие, пояснение к коду, подсказка…")
         self.edit.textChanged.connect(self._on_text)
         self.stack.addWidget(self.view)
         self.stack.addWidget(self.edit)
         self.body.addWidget(self.stack)
+        self.body.setContentsMargins(6, 0, 0, 0)
+        theme.changed.connect(self._on_theme)
         self._render()
         self.set_editing(not block.text.strip())
+
+    def _on_theme(self) -> None:
+        self._render()
+        self._update_toggle()
 
     def eventFilter(self, obj, ev) -> bool:
         if ev.type() == ev.Type.MouseButtonDblClick:
@@ -183,6 +252,7 @@ class MarkdownBlockWidget(BlockWidget):
         self.changed.emit()
 
     def _render(self) -> None:
+        self.view.document().setDefaultStyleSheet(_markdown_css())
         self.view.setMarkdown(self.block.text or "*Пустой блок — дважды щёлкните, чтобы написать*")
         QTimer.singleShot(0, self, self._fit)
 
@@ -196,19 +266,23 @@ class MarkdownBlockWidget(BlockWidget):
     def _fit_edit(self) -> None:
         if self.stack.currentWidget() is self.edit:
             lines = max(4, min(25, self.edit.document().blockCount() + 1))
-            h = lines * self.edit.fontMetrics().lineSpacing() + 16
+            h = lines * self.edit.fontMetrics().lineSpacing() + 18
             self.edit.setFixedHeight(h)
             self.stack.setFixedHeight(h)
+
+    def _update_toggle(self) -> None:
+        editing = self.stack.currentWidget() is self.edit
+        self.toggle.setText("Готово" if editing else "Править")
+        self.toggle.setIcon(icons.icon("check" if editing else "pencil", "accent" if editing else "dim", 14))
 
     def set_editing(self, on: bool) -> None:
         if on:
             self.stack.setCurrentWidget(self.edit)
-            self.toggle.setText("✔ Готово")
             self.edit.setFocus()
         else:
             self._render()
             self.stack.setCurrentWidget(self.view)
-            self.toggle.setText("✎ Править")
+        self._update_toggle()
         self._fit()
 
     def toggle_mode(self) -> None:
@@ -216,7 +290,8 @@ class MarkdownBlockWidget(BlockWidget):
 
     def set_zoom(self, zoom: int) -> None:
         f = QApplication.font()
-        f.setPointSizeF(f.pointSizeF() * zoom / 100)
+        base = f.pixelSize() if f.pixelSize() > 0 else 13
+        f.setPixelSize(max(6, round(base * zoom / 100)))
         self.view.setFont(f)
         self.edit.setFont(code_font(max(5, round(10 * zoom / 100))))
         self._render()
@@ -232,35 +307,145 @@ class MarkdownBlockWidget(BlockWidget):
 class CodeBlockWidget(BlockWidget):
     arm_requested = Signal(object)
     selection_changed = Signal(object)
+    steps_changed = Signal(object)              # разметка шагов поменялась
+    step_pointer_requested = Signal(object, int)   # «печатать дальше с шага k»
 
     def __init__(self, block: Block, number: int) -> None:
         super().__init__(block, number)
         self.armed = False
-        self.arm_btn = _tool("▶ Печатать этот", "Сделать этот блок активным для печати по хоткею")
+        self.step_mode = False
+        self.step_next: int | None = None       # какой шаг печатать следующим (None — все напечатаны)
+        self.arm_btn = QToolButton()
+        self.arm_btn.setObjectName("armBtn")
         self.arm_btn.setCheckable(True)
+        self.arm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.arm_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.arm_btn.setIconSize(QSize(11, 11))
+        self.arm_btn.setToolTip("Сделать этот блок активным для печати по хоткею")
         self.arm_btn.clicked.connect(lambda: self.arm_requested.emit(self))
         self.left_slot.addWidget(self.arm_btn)
         self.info = QLabel()
-        self.info.setStyleSheet("color: gray;")
+        self.info.setObjectName("dim")
         self.left_slot.addWidget(self.info)
+        self.steps_btn = QToolButton()
+        self.steps_btn.setObjectName("armBtn")
+        self.steps_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.steps_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.steps_btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.steps_btn.setIconSize(QSize(12, 12))
+        self.steps_btn.setToolTip("Печать по шагам: шаг строки — правый щелчок по строке, Alt+1…9 "
+                                  "или щелчок по цветному номеру слева")
+        self.steps_menu = QMenu(self.steps_btn)
+        self.steps_menu.aboutToShow.connect(self._fill_steps_menu)
+        self.steps_btn.setMenu(self.steps_menu)
+        self.left_slot.addWidget(self.steps_btn)
         self.lang = QComboBox()
+        self.lang.setObjectName("langCombo")
         self.lang.setEditable(True)
         self.lang.addItems(LANGUAGES)
         self.lang.setCurrentText(block.lang)
+        self.lang.setFixedWidth(118)
         self.lang.setToolTip("Язык подсветки (на печать не влияет)")
         self.lang.currentTextChanged.connect(self._on_lang)
         self.right_slot.addWidget(self.lang)
 
+        self.frame = QFrame()
+        self.frame.setObjectName("codeFrame")
+        fl = QVBoxLayout(self.frame)
+        fl.setContentsMargins(0, 2, 0, 0)
         self.editor = CodeEditor(block.text, block.lang)
         self.editor.setPlaceholderText("Код образца. Выделите строки — будут напечатаны только они.")
         self.editor.textChanged.connect(self._on_text)
         self.editor.selectionChanged.connect(self._on_selection)
         self.editor.focused.connect(lambda: self.arm_requested.emit(self))
         self.editor.height_changed.connect(self._fit)
-        self.body.addWidget(self.editor)
+        self.editor.set_steps(block.steps)
+        self.editor.steps_changed.connect(self._on_steps)
+        self.editor.markup_requested.connect(self._markup)
+        fl.addWidget(self.editor)
+        self.body.addWidget(self.frame)
         self._restore_selection()
         self._fit()
         self._update_info()
+        self.set_armed(False)
+        self._update_steps()
+        theme.changed.connect(self._on_theme)
+
+    def _on_theme(self) -> None:
+        self._update_info()
+        self.set_armed(self.armed)
+        self._update_steps()
+
+    # ---- шаги
+    def step_numbers(self) -> list[int]:
+        return sorted(set(self.editor.line_steps())) or [1]
+
+    def _on_steps(self) -> None:
+        steps = self.editor.line_steps()
+        self.block.steps = [] if all(s == 1 for s in steps) else steps
+        self._update_steps()
+        self.steps_changed.emit(self)
+        self.changed.emit()
+
+    def _markup(self, key: str) -> None:
+        from .. import steps as S
+        text = self.block.text
+        if key == "comments":
+            new = S.auto_by_comments(text, self.block.lang)
+        elif key == "blank":
+            new = S.auto_by_blank_lines(text)
+        else:
+            new = []
+        self.editor.set_steps(new)
+        self.editor.set_steps_visible(True)
+        self._on_steps()
+
+    def set_step_mode(self, on: bool, next_step: int | None) -> None:
+        self.step_mode, self.step_next = on, next_step
+        self._update_steps()
+
+    def _update_steps(self) -> None:
+        nums = self.step_numbers()
+        multi = len(nums) > 1
+        self.editor.set_steps_visible(multi or self.step_mode)
+        self.steps_btn.setVisible(multi or self.step_mode)
+        if self.step_mode:
+            if self.step_next is None:
+                text = f"Шаги: все {len(nums)} готовы"
+            else:
+                idx = nums.index(self.step_next) + 1 if self.step_next in nums else 1
+                text = f"Шаг {idx} из {len(nums)}"
+            self.editor.set_step_view(self.step_next if self.step_next is not None else max(nums) + 1)
+        else:
+            text = f"Шагов: {len(nums)}"
+            self.editor.set_step_view(None)
+        self.steps_btn.setText(text)
+        self.steps_btn.setIcon(icons.icon("layers", "accent" if self.step_mode else "dim", 12))
+
+    def _fill_steps_menu(self) -> None:
+        m = self.steps_menu
+        m.clear()
+        nums = self.step_numbers()
+        head = m.addAction("Печатать дальше с шага:")
+        head.setEnabled(False)
+        counts = {k: 0 for k in nums}
+        for s in self.editor.line_steps():
+            counts[s] = counts.get(s, 0) + 1
+        for i, k in enumerate(nums, start=1):
+            a = m.addAction(f"Шаг {i}  ·  строк: {counts.get(k, 0)}")
+            a.setCheckable(True)
+            a.setChecked(self.step_mode and k == self.step_next)
+            a.triggered.connect(lambda _=False, k=k: self.step_pointer_requested.emit(self, k))
+        m.addSeparator()
+        for key, text in (("comments", "Разметить по комментариям"), ("blank", "Разметить по пустым строкам"),
+                          ("reset", "Сбросить: весь блок — шаг 1")):
+            m.addAction(text, lambda key=key: self._markup(key))
+        m.addSeparator()
+        hint = m.addAction("Шаг строки: правый щелчок по строке, Alt+1…9, Alt+0 — новый")
+        hint.setEnabled(False)
+
+    def set_step_progress(self, step: int, pos: int) -> None:
+        self.editor.set_step_view(step, pos)
 
     def set_number(self, n: int) -> None:
         self.code_number = n
@@ -312,18 +497,25 @@ class CodeBlockWidget(BlockWidget):
         if self.block.sel:
             a, b = self.block.sel
             n = text[a:b].rstrip("\n").count("\n") + 1
-            self.info.setText(f"· выделено строк: {n} из {lines}")
-            self.info.setStyleSheet("color: #d29922; font-weight: bold;")
+            self.info.setText(f"<span style='color:{css(theme.c('accent'))}'>выделено строк: {n} из {lines}</span>")
         else:
-            self.info.setText(f"· {lines} стр., {len(text)} симв.")
-            self.info.setStyleSheet("color: gray;")
+            self.info.setText(f"{lines} стр. · {len(text)} симв.")
 
     def set_armed(self, on: bool) -> None:
         self.armed = on
         self.arm_btn.setChecked(on)
-        self.arm_btn.setText("● Активный" if on else "▶ Печатать этот")
-        self.setStyleSheet(f"QFrame#block {{ border: 2px solid {ARMED_COLOR}; border-radius: 6px; }}"
-                           if on else "")
+        self.arm_btn.setText("Активный" if on else "Печатать этот")
+        self.arm_btn.setIcon(icons.icon("play", "accent" if on else "dim", 11))
+        if self.property("armed") != on:
+            self.setProperty("armed", on)
+            repolish(self)
+
+    def set_progress(self, start: int, pos: int, end: int) -> None:
+        self.editor.set_progress(start, pos, end)
+
+    def clear_progress(self) -> None:
+        self.editor.clear_progress()
+        self._update_steps()   # вид шагов — снова «что дальше», а не ход печати
 
     def typing_text(self, whole_lines: bool) -> tuple[str, int]:
         return typing_slice(self.block.text, self.block.sel, whole_lines)

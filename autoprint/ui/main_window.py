@@ -1,126 +1,107 @@
-"""Главное окно: библиотека образцов, вкладки, панель управления печатью, трей."""
+"""Главное окно: свой заголовок, библиотека образцов слева, пульт печати, лента блоков, трей."""
 from __future__ import annotations
 
 import logging
-import struct
 import time
-from dataclasses import asdict
 from pathlib import Path
 
-from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QRect, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
-from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QProgressBar, QPushButton, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget,
-                               QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import QByteArray, QEvent, QSize, Qt, QTimer
+from PySide6.QtGui import QCursor, QKeySequence, QShortcut
+from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QInputDialog, QListWidgetItem, QMenu,
+                               QMessageBox, QStackedWidget, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
-from .. import APP_NAME, __version__, taskbar, updater
-from ..comments import strip_comments
+from .. import APP_NAME, __version__, system, taskbar, updater
+from .. import steps as S
+from ..comments import comment_spans, comment_text, strip_comments
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
 from ..importers import export_ipynb, import_ipynb, import_markdown, import_python
 from ..sounds import KeySoundPlayer
-from ..storage import PROFILES, Settings, Template, TemplateStore
-from ..typer import COUNTDOWN, FINISHED, IDLE, PAUSED, RUNNING, TypingEngine
+from ..storage import Block, Settings, Template, TemplateStore, steps_sample_template
+from ..typer import COUNTDOWN, FINISHED, IDLE, LINE_WAIT, PAUSED, RUNNING, TypingEngine, build_units
+from .. import highlighter
+from . import icons, logo
 from .blocks import BlockWidget, typing_slice
-from .settings_dialog import HOTKEYS, SettingsDialog
+from .control_strip import STATE_TEXT, ControlStrip
+from .frameless import FramelessWindow
+from .library import ROLE_COUNT, ROLE_ID, LibraryPanel
+from .prompter import Prompter
+from .settings_window import HOTKEYS, SettingsWindow
 from .template_view import TemplateView, ZoomWheelFilter
+from .theme import STATE_TOKENS, theme
 from .updates import MODE_AUTO, MODE_DOWNLOAD, UpdateDialog, UpdateManager
-
-STATE_COLORS = {IDLE: "#3b82f6", COUNTDOWN: "#a855f7", RUNNING: "#2ea043", PAUSED: "#d29922",
-                FINISHED: "#3b82f6"}
-STATE_TEXT = {IDLE: "Готов", COUNTDOWN: "Отсчёт…", RUNNING: "Печатает", PAUSED: "Пауза",
-              FINISHED: "Готово ✓"}
-
-
-ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 96, 128, 256)
+from .widgets import IconButton, Toast
 
 log = logging.getLogger("autoprint")
 
+# настройки, после которых уже подготовленный текст нужно собрать заново
+REBUILD_KEYS = {"profile", "strip_comments", "human_typing", "typos_per_100", "think_pause_s", "tab_width",
+                "fast_indent", "indent_with_tab", "selection_whole_lines", "print_mode"}
+BUSY = (RUNNING, COUNTDOWN, PAUSED, LINE_WAIT)
+MODE_BLOCK, MODE_LINES, MODE_STEPS = "block", "lines", "steps"
 
-def make_icon_pixmap(color: str, size: int = 64) -> QPixmap:
-    pm = QPixmap(size, size)
-    pm.fill(Qt.GlobalColor.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-    p.scale(size / 64, size / 64)   # рисуется в координатах 64×64
-    p.setBrush(QColor("#1e2229"))
-    p.setPen(Qt.PenStyle.NoPen)
-    p.drawRoundedRect(2, 2, 60, 60, 12, 12)
-    p.setBrush(QColor(color))
-    p.drawRoundedRect(2, 50, 60, 12, 6, 6)
-    p.setPen(QColor(color))
-    f = QFont("Consolas", 22)
-    f.setBold(True)
-    p.setFont(f)
-    p.drawText(QRect(0, -8, 64, 64), Qt.AlignmentFlag.AlignCenter, "</>")
-    p.end()
-    return pm
+# exe окна → как его назвать на пульте
+APP_NAMES = {"code": "VS Code", "notepad": "Блокнот", "chrome": "Chrome", "msedge": "Edge", "firefox": "Firefox",
+             "pycharm64": "PyCharm", "idea64": "IntelliJ IDEA", "windowsterminal": "Терминал",
+             "sublime_text": "Sublime Text", "notepad++": "Notepad++", "yandex": "Яндекс Браузер",
+             "browser": "Яндекс Браузер", "opera": "Opera", "cursor": "Cursor", "pythonw": "Python",
+             "python": "Python", "jupyter-lab": "JupyterLab"}
 
 
-def make_icon(color: str) -> QIcon:
-    icon = QIcon()
-    for s in ICON_SIZES:
-        icon.addPixmap(make_icon_pixmap(color, s))
-    return icon
+def app_name(exe: str) -> str:
+    base = exe.rsplit("\\", 1)[-1]
+    if base.lower().endswith(".exe"):
+        base = base[:-4]
+    return APP_NAMES.get(base.lower(), base or "окно")
 
 
-def save_ico(color: str, path: Path) -> bool:
-    """Многоразмерный .ico (PNG внутри) — его Windows показывает на панели задач."""
-    images = []
-    for s in ICON_SIZES:
-        buf = QBuffer()
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        make_icon_pixmap(color, s).save(buf, "PNG")
-        images.append((s, bytes(buf.data())))
-    head = struct.pack("<HHH", 0, 1, len(images))
-    offset = len(head) + 16 * len(images)
-    entries = b""
-    for s, data in images:
-        entries += struct.pack("<BBBBHHII", s % 256, s % 256, 0, 0, 1, 32, len(data), offset)
-        offset += len(data)
-    try:
-        path.write_bytes(head + entries + b"".join(d for _s, d in images))
-        return True
-    except OSError:
-        return False
-
-
-class MainWindow(QMainWindow):
+class MainWindow(FramelessWindow):
     def __init__(self, settings: Settings, store: TemplateStore) -> None:
-        super().__init__()
+        super().__init__(APP_NAME)
         self.settings = settings
         self.store = store
         self._zoom_filter = ZoomWheelFilter(self)
         QApplication.instance().installEventFilter(self._zoom_filter)
-        self.icons ={st: make_icon(c) for st, c in STATE_COLORS.items()}
-        self.setWindowIcon(self.icons[IDLE])
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1200, 780)
+        self.tray_icons = {k: logo.make_icon(k) for k in (logo.IDLE, logo.RUNNING, logo.PAUSED)}
+        self.setWindowIcon(logo.make_icon(logo.APP))
+        self.resize(1320, 840)
+        self.setMinimumSize(980, 600)
 
         self.engine = TypingEngine(settings)
         self.player = KeySoundPlayer(settings.sound_style, settings.sound_volume, settings.sound_enabled)
         self.engine.sound.connect(self.player.play)
         self.engine.state_changed.connect(self._on_state)
         self.engine.progress.connect(self._on_progress)
-        self.engine.message.connect(self._notify)
+        self.engine.message.connect(lambda t: self._notify(t, warn=True))
         self.engine.countdown.connect(self._on_countdown)
         self.engine.finished.connect(self._on_finished)
-        self.job: dict | None = None   # {tid, bid, base, text}
+        self.engine.target.connect(self._on_target)
+        self.job: dict | None = None   # {kind, tid, bid, base, text, omap, src_len[, step]}
+        self._target = ""
+        self.step_next: dict[str, int | None] = {}   # id блока → какой шаг печатать следующим (None — все)
 
         self.guard = InputGuard()
         self.guard.tripped.connect(self._on_guard)
+        self.guard.enter_pressed.connect(lambda: self.engine.continue_line(by_enter=True))
 
         self.hotkeys = HotkeyManager()
         self.hotkeys.triggered.connect(self._on_hotkey)
         self.hotkeys.failed.connect(lambda t: self._notify(
-            f"Не удалось занять хоткеи: {t} (заняты другой программой?). Смените их в настройках.", True))
+            f"Не удалось занять хоткеи: {t} (заняты другой программой?). Смените их в настройках.", warn=True))
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
         self._save_timer.timeout.connect(self._save_store)
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.setInterval(400)
+        self._settings_timer.timeout.connect(self._save_settings)
+        self._label_timer = QTimer(self)
+        self._label_timer.setSingleShot(True)
+        self._label_timer.setInterval(150)
+        self._label_timer.timeout.connect(self._update_armed_label)
+        self._analysis: tuple | None = None   # (ключ, строки) — разбор активного блока по шагам
 
         self.updates = UpdateManager(settings, self)
         self.updates.checked.connect(self._on_update_checked)
@@ -129,10 +110,15 @@ class MainWindow(QMainWindow):
         self.updates.download_failed.connect(lambda t: log.warning("Обновление не скачано: %s", t))
         self.relaunch_requested = False   # app.py перезапустит программу после выхода
         self._auto_checked_once = False
+        self.settings_win: SettingsWindow | None = None
+        self.views: dict[str, TemplateView] = {}
 
         self._build_ui()
         self._build_tray()
+        theme.changed.connect(self._on_theme)
+        self._on_theme()
         self._apply_settings()
+        self._apply_hotkeys()
         self._restore_session()
 
         # автопроверка: вскоре после запуска, затем раз в час смотрим, не пора ли
@@ -145,188 +131,108 @@ class MainWindow(QMainWindow):
 
     # ================================================================ UI
     def _build_ui(self) -> None:
-        central = QWidget()
-        root = QVBoxLayout(central)
-        root.setContentsMargins(8, 6, 8, 4)
-        root.setSpacing(6)
+        tb = self.titlebar
+        self.logo_btn = QToolButton()
+        self.logo_btn.setObjectName("logoBtn")
+        self.logo_btn.setIconSize(QSize(18, 18))
+        self.logo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.logo_btn.setToolTip("Меню программы")
+        self.logo_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.logo_menu = QMenu(self.logo_btn)
+        self.logo_menu.aboutToShow.connect(self._fill_logo_menu)
+        self.logo_btn.setMenu(self.logo_menu)
+        tb.left.addWidget(self.logo_btn)
+        self.btn_settings = IconButton("settings", "Настройки (Ctrl+,)", 17, box=32)
+        self.btn_settings.setObjectName("titleTool")
+        self.btn_settings.clicked.connect(lambda: self.open_settings())
+        self.btn_about = IconButton("info", "О программе", 17, box=32)
+        self.btn_about.setObjectName("titleTool")
+        self.btn_about.clicked.connect(lambda: self.open_settings("about"))
+        tb.right.addWidget(self.btn_settings)
+        tb.right.addWidget(self.btn_about)
 
-        # ---- панель управления
-        bar = QHBoxLayout()
-        self.btn_toggle = QPushButton("▶ Старт")
-        self.btn_toggle.setMinimumWidth(130)
-        self.btn_toggle.clicked.connect(lambda: self.cmd_toggle(from_button=True))
-        self.btn_restart = QPushButton("⟲ Сначала")
-        self.btn_restart.clicked.connect(lambda: self.cmd_restart(from_button=True))
-        self.btn_stop = QPushButton("■ Стоп")
-        self.btn_stop.clicked.connect(self.cmd_stop)
-        for b in (self.btn_toggle, self.btn_restart, self.btn_stop):
-            bar.addWidget(b)
-        bar.addSpacing(12)
-        bar.addWidget(QLabel("Окно:"))
-        self.profile = QComboBox()
-        for k, v in PROFILES.items():
-            self.profile.addItem(v, k)
-        self.profile.currentIndexChanged.connect(self._on_profile)
-        bar.addWidget(self.profile)
-        bar.addWidget(QLabel("Скорость:"))
-        self.cpm = QSpinBox()
-        self.cpm.setRange(30, 3000)
-        self.cpm.setSingleStep(20)
-        self.cpm.setSuffix(" симв/мин")
-        self.cpm.valueChanged.connect(self._on_cpm)
-        bar.addWidget(self.cpm)
-        self.btn_sound = QToolButton()
-        self.btn_sound.setCheckable(True)
-        self.btn_sound.setToolTip("Звук клавиш")
-        self.btn_sound.toggled.connect(self._on_sound_toggle)
-        bar.addWidget(self.btn_sound)
-        self.vol = QSlider(Qt.Orientation.Horizontal)
-        self.vol.setRange(0, 100)
-        self.vol.setFixedWidth(110)
-        self.vol.setToolTip("Громкость клавиш")
-        self.vol.valueChanged.connect(self._on_volume)
-        self.vol.sliderReleased.connect(self._on_volume_released)
-        bar.addWidget(self.vol)
-        bar.addStretch(1)
-        btn_settings = QPushButton("⚙ Настройки")
-        btn_settings.clicked.connect(self.open_settings)
-        bar.addWidget(btn_settings)
-        root.addLayout(bar)
+        self.body.setObjectName("appRoot")
+        self.body.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        root = QHBoxLayout(self.body)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # ---- строка состояния печати
-        st = QHBoxLayout()
-        self.state_lbl = QLabel()
-        self.state_lbl.setMinimumWidth(110)
-        self.armed_lbl = QLabel()
-        self.progress = QProgressBar()
-        self.progress.setMaximumWidth(260)
-        self.progress.setTextVisible(True)
-        self.hint_lbl = QLabel()
-        self.hint_lbl.setStyleSheet("color: gray;")
-        st.addWidget(self.state_lbl)
-        st.addWidget(self.armed_lbl, 1)
-        st.addWidget(self.progress)
-        st.addWidget(self.hint_lbl)
-        root.addLayout(st)
+        self.library = LibraryPanel()
+        lib = self.library.list
+        lib.itemClicked.connect(lambda it: self.open_template(it.data(ROLE_ID)))
+        lib.currentItemChanged.connect(lambda it, _prev: self.open_template(it.data(ROLE_ID)) if it else None)
+        lib.itemChanged.connect(self._on_library_renamed)
+        lib.customContextMenuRequested.connect(self._library_menu)
+        self.library.search.textChanged.connect(self._filter_library)
+        self.library.new_requested.connect(self.new_template)
+        self.library.import_requested.connect(self.import_files)
+        self.library.update_clicked.connect(self.open_update_dialog)
+        root.addWidget(self.library)
 
-        # ---- библиотека + вкладки
-        self.split = QSplitter(Qt.Orientation.Horizontal)
-        lib = QWidget()
-        ll = QVBoxLayout(lib)
-        ll.setContentsMargins(0, 0, 4, 0)
-        ll.addWidget(QLabel("<b>Образцы</b>"))
-        self.search = QLineEdit()
-        self.search.setPlaceholderText("Поиск…")
-        self.search.setClearButtonEnabled(True)
-        self.search.textChanged.connect(self._filter_library)
-        ll.addWidget(self.search)
-        self.library = QListWidget()
-        self.library.itemClicked.connect(lambda it: self.open_template(it.data(Qt.ItemDataRole.UserRole)))
-        self.library.itemChanged.connect(self._on_library_renamed)
-        self.library.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.library.customContextMenuRequested.connect(self._library_menu)
-        ll.addWidget(self.library, 1)
-        row1 = QHBoxLayout()
-        b_new = QPushButton("＋ Новый")
-        b_new.clicked.connect(self.new_template)
-        b_imp = QPushButton("⇩ Импорт…")
-        b_imp.setToolTip("Импорт из .ipynb (Jupyter), .md или .json")
-        b_imp.clicked.connect(self.import_files)
-        row1.addWidget(b_new)
-        row1.addWidget(b_imp)
-        ll.addLayout(row1)
-        self.split.addWidget(lib)
+        main = QWidget()
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(22, 16, 10, 0)
+        ml.setSpacing(14)
+        self.strip = ControlStrip()
+        self.strip.toggle_clicked.connect(lambda: self.cmd_toggle(from_button=True))
+        self.strip.restart_clicked.connect(lambda: self.cmd_restart(from_button=True))
+        self.strip.stop_clicked.connect(self.cmd_stop)
+        self.strip.cpm_changed.connect(self._on_cpm)
+        self.strip.human_toggled.connect(self._on_human_toggle)
+        self.strip.strip_toggled.connect(self._on_strip_toggle)
+        self.strip.sound_toggled.connect(self._on_sound_toggle)
+        self.strip.volume_changed.connect(self._on_volume)
+        self.strip.volume_released.connect(self._on_volume_released)
+        self.strip.profile_changed.connect(self._on_profile)
+        self.strip.mode_changed.connect(self._on_mode)
+        strip_wrap = QVBoxLayout()
+        strip_wrap.setContentsMargins(0, 0, 12, 0)
+        strip_wrap.setSpacing(10)
+        strip_wrap.addWidget(self.strip)
+        self.prompter = Prompter()
+        strip_wrap.addWidget(self.prompter)
+        ml.addLayout(strip_wrap)
+        self.stack = QStackedWidget()
+        ml.addWidget(self.stack, 1)
+        root.addWidget(main, 1)
+        self.toast = Toast(main)
 
-        self.tabs = QTabWidget()
-        self.tabs.setTabsClosable(True)
-        self.tabs.setMovable(True)
-        self.tabs.setDocumentMode(True)
-        self.tabs.tabCloseRequested.connect(self.close_tab)
-        self.tabs.currentChanged.connect(self._on_tab_changed)
-        self.tabs.tabBar().tabBarDoubleClicked.connect(self._rename_tab)
-        self.tabs.setCornerWidget(self._tabs_corner(), Qt.Corner.TopRightCorner)
-        self.split.addWidget(self.tabs)
-        self.split.setStretchFactor(1, 1)
-        self.split.setSizes([230, 970])
-        root.addWidget(self.split, 1)
-        self.setCentralWidget(central)
-
-        # ---- меню
-        m = self.menuBar().addMenu("Файл")
-        self._act(m, "Новый образец", self.new_template, "Ctrl+N")
-        self._act(m, "Импорт (.ipynb, .md, .py, .json)…", self.import_files, "Ctrl+O")
-        self._act(m, "Экспорт образца в .ipynb…", lambda: self.export_current("ipynb"))
-        self._act(m, "Экспорт образца в .json…", lambda: self.export_current("json"))
-        m.addSeparator()
-        self._act(m, "Открыть папку с данными", self._open_data_dir)
-        self._act(m, "Открыть журнал работы", self._open_log)
-        m.addSeparator()
-        self._act(m, "Выход", self.quit_app, "Ctrl+Q")
-        m = self.menuBar().addMenu("Печать")
-        self._act(m, "Старт / пауза", lambda: self.cmd_toggle(from_button=True))
-        self._act(m, "Сначала", lambda: self.cmd_restart(from_button=True))
-        self._act(m, "Стоп", self.cmd_stop)
-        m.addSeparator()
-        self._act(m, "Следующий блок кода", lambda: self.cmd_block(+1), "Alt+Down")
-        self._act(m, "Предыдущий блок кода", lambda: self.cmd_block(-1), "Alt+Up")
-        m.addSeparator()
-        self.act_strip = self._act(m, "Без комментариев", self._on_strip_toggle)
-        self.act_strip.setCheckable(True)
-        self.act_human = self._act(m, "Как человек (ритм, паузы, опечатки)", self._on_human_toggle)
-        self.act_human.setCheckable(True)
-        self._act(m, "Настройки…", self.open_settings, "Ctrl+,")
-        m = self.menuBar().addMenu("Вид")
-        self._act(m, "Блок крупнее", lambda: self._zoom_block(+1), "Ctrl+=")
-        self._act(m, "Блок мельче", lambda: self._zoom_block(-1), "Ctrl+-")
-        self._act(m, "Блок в обычный размер", lambda: self._zoom_block(0), "Ctrl+0")
-        self._act(m, "Все блоки образца в обычный размер", self._reset_zoom)
-        m.addSeparator()
-        m.addAction("Ctrl/Shift + колёсико — масштаб блока под мышью").setEnabled(False)
-        m = self.menuBar().addMenu("Справка")
-        self._act(m, "Как пользоваться", self.show_help, "F1")
-        m.addSeparator()
-        self._act(m, "Проверить обновления…", lambda: self.check_updates(manual=True))
-        self._act(m, "О программе", self.show_about)
-
-        self.btn_update = QToolButton()
-        self.btn_update.setAutoRaise(True)
-        self.btn_update.setStyleSheet("QToolButton { color: #2da44e; font-weight: bold; }")
-        self.btn_update.clicked.connect(self.open_update_dialog)
-        self.btn_update.hide()
-        self.statusBar().addPermanentWidget(self.btn_update)
-
-        QShortcut(QKeySequence("Ctrl+Tab"), self, lambda: self.cmd_next_tab(+1))
-        QShortcut(QKeySequence("Ctrl+Shift+Tab"), self, lambda: self.cmd_next_tab(-1))
-        QShortcut(QKeySequence("Ctrl+W"), self, lambda: self.close_tab(self.tabs.currentIndex()))
+        sc = [("Ctrl+N", self.new_template), ("Ctrl+O", self.import_files), ("Ctrl+Q", self.quit_app),
+              ("Ctrl+,", lambda: self.open_settings()), ("F1", lambda: self.open_settings("about")),
+              ("Alt+Down", lambda: self.cmd_block(+1)), ("Alt+Up", lambda: self.cmd_block(-1)),
+              ("Ctrl+=", lambda: self._zoom_block(+1)), ("Ctrl++", lambda: self._zoom_block(+1)),
+              ("Ctrl+-", lambda: self._zoom_block(-1)), ("Ctrl+0", lambda: self._zoom_block(0)),
+              ("Ctrl+Shift+0", self._reset_zoom),
+              ("Ctrl+Tab", lambda: self.cmd_next_tab(+1)), ("Ctrl+Shift+Tab", lambda: self.cmd_next_tab(-1))]
         for i in range(1, 10):
-            QShortcut(QKeySequence(f"Ctrl+{i}"), self, lambda i=i: self._goto_tab(i - 1))
+            sc.append((f"Ctrl+{i}", lambda i=i: self._goto_template(i - 1)))
+        for seq, slot in sc:
+            QShortcut(QKeySequence(seq), self, slot)
 
-    def _tabs_corner(self) -> QWidget:
-        b = QToolButton()
-        b.setText("☰")
-        b.setToolTip("Список открытых вкладок")
-        b.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        menu = QMenu(b)
-        menu.aboutToShow.connect(lambda: self._fill_tabs_menu(menu))
-        b.setMenu(menu)
-        return b
-
-    def _fill_tabs_menu(self, menu: QMenu) -> None:
-        menu.clear()
-        for i in range(self.tabs.count()):
-            a = menu.addAction(f"{i + 1}. {self.tabs.tabText(i)}")
-            a.triggered.connect(lambda _=False, i=i: self.tabs.setCurrentIndex(i))
-
-    def _act(self, menu, text, slot, shortcut=None) -> QAction:
-        a = QAction(text, self)
-        a.triggered.connect(slot)
-        if shortcut:
-            a.setShortcut(QKeySequence(shortcut))
-        menu.addAction(a)
-        return a
+    def _fill_logo_menu(self) -> None:
+        # сочетания здесь — только подпись («\t…»): сами клавиши — QShortcut окна; setShortcut у пунктов
+        # меню сделал бы их двусмысленными, и Qt не запускал бы ни то ни другое
+        m = self.logo_menu
+        m.clear()
+        m.addAction(icons.icon("settings"), "Настройки…\tCtrl+,", lambda: self.open_settings())
+        m.addAction(icons.icon("info"), "О программе", lambda: self.open_settings("about"))
+        m.addAction(icons.icon("help"), "Как пользоваться\tF1", lambda: self.open_settings("about"))
+        m.addAction(icons.icon("refresh"), "Проверить обновления…", lambda: self.check_updates(manual=True))
+        m.addSeparator()
+        m.addAction(icons.icon("plus"), "Новый образец\tCtrl+N", self.new_template)
+        m.addAction(icons.icon("import"), "Импорт…\tCtrl+O", self.import_files)
+        m.addAction(icons.icon("export"), "Экспорт образца в .ipynb…", lambda: self.export_current("ipynb"))
+        m.addAction(icons.icon("export"), "Экспорт образца в .json…", lambda: self.export_current("json"))
+        m.addSeparator()
+        m.addAction(icons.icon("file-code"), "Добавить пример пошагового урока", self._add_steps_sample)
+        m.addAction(icons.icon("lines"), "Все блоки — обычный размер\tCtrl+Shift+0", self._reset_zoom)
+        m.addAction(icons.icon("file-text"), "Журнал работы", self._open_log)
+        m.addAction(icons.icon("folder"), "Папка с данными", self._open_data_dir)
+        m.addSeparator()
+        m.addAction(icons.icon("logout"), "Выход\tCtrl+Q", self.quit_app)
 
     def _build_tray(self) -> None:
-        self.tray = QSystemTrayIcon(self.icons[IDLE], self)
+        self.tray = QSystemTrayIcon(self.tray_icons[logo.IDLE], self)
         menu = QMenu()
         menu.addAction("Показать окно", self._show_window)
         menu.addSeparator()
@@ -335,41 +241,37 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         self.tray_update = menu.addAction("Обновление…", self.open_update_dialog)
         self.tray_update.setVisible(False)
+        menu.addAction("Настройки…", lambda: self.open_settings())
         menu.addAction("Выход", self.quit_app)
+        self.tray_menu = menu
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda r: self._show_window()
                                     if r == QSystemTrayIcon.ActivationReason.Trigger else None)
         self.tray.setToolTip(APP_NAME)
         self.tray.show()
+        self._quitting = False
+        self._tray_hint_shown = False
+        if self.settings.pin_tray_icon:   # значок у часов: запись в реестре появится после показа значка
+            system.pin_tray_icon(True)
+        if self.settings.autostart:      # путь программы мог измениться — обновить запись автозапуска
+            system.set_autostart(True)
+
+    def _on_theme(self) -> None:
+        highlighter.set_palette("dark" if theme.dark else "light")
+        self.logo_btn.setIcon(logo.make_icon(logo.IDLE, theme.c("accent")))
+        self.restyle_frame()
+        self._on_state(self.engine.state)
+        self.library.list.viewport().update()
 
     # ================================================================ настройки
     def _apply_settings(self) -> None:
         s = self.settings
-        self.profile.blockSignals(True)
-        self.profile.setCurrentIndex(max(0, self.profile.findData(s.profile)))
-        self.profile.blockSignals(False)
-        self.cpm.blockSignals(True)
-        self.cpm.setValue(s.cpm)
-        self.cpm.blockSignals(False)
-        self.btn_sound.blockSignals(True)
-        self.btn_sound.setChecked(s.sound_enabled)
-        self.btn_sound.setText("🔊" if s.sound_enabled else "🔇")
-        self.btn_sound.blockSignals(False)
-        self.vol.blockSignals(True)
-        self.vol.setValue(s.sound_volume)
-        self.vol.setEnabled(s.sound_enabled)
-        self.vol.blockSignals(False)
-        self.act_strip.setChecked(s.strip_comments)
-        self.act_human.setChecked(s.human_typing)
+        theme.set_mode(s.theme)
+        self.strip.set_settings(s)
         self.player.enabled = s.sound_enabled
         self.player.set_style(s.sound_style)
         self.player.set_volume(s.sound_volume)
-        self.hotkeys.set_bindings({k: getattr(s, k) for k, _ in HOTKEYS})
         self.guard.enabled = s.guard_enabled
-        self.guard.set_hotkeys({hk for k, _ in HOTKEYS if (hk := parse_hotkey(getattr(s, k)))})
-        hk = s.hotkey_toggle or "—"
-        self.hint_lbl.setText(f"{hk} — старт/пауза · {s.hotkey_restart or '—'} — сначала · "
-                              f"{s.hotkey_stop or '—'} — стоп")
         on_top = bool(self.windowFlags() & Qt.WindowType.WindowStaysOnTopHint)
         if on_top != s.always_on_top:
             visible = self.isVisible()
@@ -379,171 +281,292 @@ class MainWindow(QMainWindow):
             if visible:
                 self.show()
         self.engine.rebuild()
+        self._apply_mode()
         self._on_state(self.engine.state)
+        self._update_armed_label()
+
+    def _apply_mode(self) -> None:
+        """Режим печати → вид блоков (колонка шагов, подсветка следующего шага) и суфлёр."""
+        steps_on = self.settings.print_mode == MODE_STEPS
+        for v in self.views.values():
+            v.apply_step_mode(steps_on)
+        self._refresh_prompter()
+
+    def _on_mode(self, mode: str) -> None:
+        if mode == self.settings.print_mode:
+            return
+        if self.engine.state in BUSY:
+            self.cmd_stop()
+        self.settings.print_mode = mode
+        self.strip.set_settings(self.settings)   # переключатель на пульте — если режим сменили не с пульта
+        self._invalidate_job_if_idle()
+        self.engine.rebuild()
+        self._settings_touched()
+        self._apply_mode()
+        self._update_armed_label()
+        self._notify({MODE_BLOCK: "Печать блока целиком.",
+                      MODE_LINES: f"По строкам: {self.settings.hotkey_toggle} — первая строка, дальше Enter "
+                                  "в редакторе — следующая. Пустые строки идут сами.",
+                      MODE_STEPS: f"По шагам: {self.settings.hotkey_toggle} печатает следующий шаг. Шаги "
+                                  "размечаются слева от номеров строк (правый щелчок, Alt+1…9)."}[mode]
+                     if mode in (MODE_BLOCK, MODE_LINES, MODE_STEPS) else "")
+
+    def _apply_hotkeys(self) -> None:
+        s = self.settings
+        self.hotkeys.set_bindings({k: getattr(s, k) for k, _t, _i in HOTKEYS})
+        self.guard.set_hotkeys({hk for k, _t, _i in HOTKEYS if (hk := parse_hotkey(getattr(s, k)))})
+        self.strip.set_settings(s)
 
     def _save_settings(self) -> None:
+        self._settings_timer.stop()
         self.settings.save()
 
-    def _on_profile(self) -> None:
-        self.settings.profile = self.profile.currentData()
+    def _settings_touched(self) -> None:
+        """Изменение с пульта: сохранить чуть позже и показать новое значение в окне настроек."""
+        self._settings_timer.start()
+        if self.settings_win:
+            self.settings_win.reload()
+
+    def _on_setting_changed(self, key: str) -> None:
+        """Изменение из окна настроек."""
+        s = self.settings
+        self._settings_timer.start()
+        if key == "sound_volume":   # ползунок шлёт много шагов — только громкость
+            self.player.set_volume(s.sound_volume)
+            self.strip.set_settings(s)
+            return
+        if key == "hotkeys":
+            self._apply_hotkeys()
+            self._set_title_status()   # подсказка «Ctrl+F9 — старт» в заголовке
+            return
+        if key == "print_mode" and self.engine.state in BUSY:
+            self.cmd_stop()   # как и переключатель на пульте: задание прежнего режима не продолжаем
+        if key in REBUILD_KEYS:
+            self._invalidate_job_if_idle()
+        if key == "update_skip_version" or key.startswith("update_"):
+            return
+        if key == "pin_tray_icon":
+            system.pin_tray_icon(s.pin_tray_icon, wait_s=2.0)
+            return
+        if key == "autostart":
+            if not system.set_autostart(s.autostart):
+                s.autostart = system.autostart_enabled()   # переключатель — как на самом деле
+                if self.settings_win:
+                    self.settings_win.reload()
+                self._notify("Не удалось изменить автозапуск (нет доступа к реестру).", warn=True)
+            return
+        if key in ("close_to_tray", "samples_seen"):
+            return
+        self._apply_settings()
+
+    def _on_profile(self, profile: str) -> None:
+        self.settings.profile = profile
         self.engine.rebuild()
         self._invalidate_job_if_idle()
-        self._save_settings()
+        self._settings_touched()
 
     def _on_cpm(self, v: int) -> None:
         self.settings.cpm = v   # движок читает скорость на лету
-        self._save_settings()
+        self._settings_touched()
 
     def _on_sound_toggle(self, on: bool) -> None:
         self.settings.sound_enabled = on
         self.player.enabled = on
-        self.btn_sound.setText("🔊" if on else "🔇")
-        self.vol.setEnabled(on)
-        self._save_settings()
+        self._settings_touched()
 
     def _on_volume(self, v: int) -> None:
         self.settings.sound_volume = v
         self.player.set_volume(v)
-        self.vol.setToolTip(f"Громкость клавиш: {v}%")
-        if not self.vol.isSliderDown():   # колёсико / клавиши — сразу, перетаскивание — по отпусканию
+        if not self.strip.vol.isSliderDown():   # колёсико / клавиши — сразу, перетаскивание — по отпусканию
             self._on_volume_released()
 
     def _on_volume_released(self) -> None:
-        self._save_settings()
+        self._settings_touched()
         if self.engine.state != RUNNING:   # услышать новую громкость
             for i, kind in enumerate(("key", "key", "space")):
                 QTimer.singleShot(i * 120, lambda k=kind: self.player.play(k))
 
-    def open_settings(self) -> None:
-        self.hotkeys.set_bindings({})  # иначе QKeySequenceEdit не увидит уже занятые сочетания
-        dlg = SettingsDialog(self.settings, self)
-        dlg.test_sound.connect(self._test_sound)
-        dlg.check_updates.connect(lambda: self.check_updates(manual=True))
-        if dlg.exec() and dlg.result_settings:
-            new = dlg.result_settings
-            for k, v in asdict(new).items():
-                setattr(self.settings, k, v)   # тот же объект — его читает движок
-            self._invalidate_job_if_idle()
-            self._save_settings()
-        self.player.set_style(self.settings.sound_style)
-        self.player.set_volume(self.settings.sound_volume)
-        self._apply_settings()
+    def open_settings(self, page: str = "") -> None:
+        if self.settings_win is None:
+            # владелец — главное окно: иначе при «Окно поверх остальных» настройки окажутся под ним
+            w = SettingsWindow(self.settings, self)
+            w.setWindowIcon(self.windowIcon())
+            w.changed.connect(self._on_setting_changed)
+            w.test_sound.connect(self._test_sound)
+            w.check_updates.connect(lambda: self.check_updates(manual=True))
+            w.open_log.connect(self._open_log)
+            w.open_data.connect(self._open_data_dir)
+            w.hotkey_capture.connect(self._on_hotkey_capture)
+            w.closed.connect(self._on_settings_closed)
+            self.settings_win = w
+            # поверх главного окна, по центру
+            g = self.geometry()
+            w.move(g.x() + (g.width() - w.width()) // 2, g.y() + max(0, (g.height() - w.height()) // 2))
+        w = self.settings_win
+        w.reload()
+        if page:
+            w.show_page(page)
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+
+    def _on_settings_closed(self) -> None:
+        self._save_settings()
+        self._apply_hotkeys()
+        if self.settings_win:
+            self.settings_win.deleteLater()
+            self.settings_win = None
+
+    def _on_hotkey_capture(self, on: bool) -> None:
+        if on:
+            self.hotkeys.set_bindings({})  # иначе запись не увидит уже занятые сочетания
+        else:
+            self._apply_hotkeys()
 
     def _on_strip_toggle(self, on: bool) -> None:
         self.settings.strip_comments = on
-        self._save_settings()
+        self._settings_touched()
         self._invalidate_job_if_idle()
         self._update_armed_label()
         self._notify("Комментарии не печатаются." if on else "Комментарии печатаются как в образце.")
 
     def _on_human_toggle(self, on: bool) -> None:
         self.settings.human_typing = on
-        self._save_settings()
+        self._settings_touched()
         self.engine.rebuild()
         self._invalidate_job_if_idle()
-        self._notify("Имитация ручного ввода включена: живой ритм, паузы, опечатки."
-                     if on else "Имитация ручного ввода выключена.")
+        self._notify("Как человек: живой ритм, паузы и опечатки." if on else "Ровная печать без опечаток.")
 
     def _test_sound(self, style: str, volume: int) -> None:
         self.player.set_style(style)
         self.player.set_volume(volume)
+        if getattr(self.player, "loading", False):
+            # новый звук собирается в фоне — сыграть, как только будет готов
+            def once(_style: str) -> None:
+                self.player.ready.disconnect(once)
+                self._play_demo()
+            self.player.ready.connect(once)
+            return
+        self._play_demo()
+
+    def _play_demo(self) -> None:
         was = self.player.enabled
         self.player.enabled = True
         for i, kind in enumerate(["key", "key", "key", "space", "key", "key", "enter"]):
             QTimer.singleShot(i * 140, lambda k=kind: self.player.play(k))
         QTimer.singleShot(1100, lambda: setattr(self.player, "enabled", was))
 
-    # ================================================================ библиотека и вкладки
+    # ================================================================ библиотека
     def _fill_library(self, select_id: str = "") -> None:
-        self.library.blockSignals(True)
-        self.library.clear()
+        lib = self.library.list
+        lib.blockSignals(True)
+        lib.clear()
         for t in self.store.templates:
             it = QListWidgetItem(t.title)
-            it.setToolTip(f"{t.title}\nБлоков кода: {len(t.code_blocks())}")
-            it.setData(Qt.ItemDataRole.UserRole, t.id)
+            it.setToolTip(f"{t.title}\nБлоков: {len(t.blocks)}, из них кода: {len(t.code_blocks())}")
+            it.setData(ROLE_ID, t.id)
+            it.setData(ROLE_COUNT, len(t.blocks))
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
-            self.library.addItem(it)
+            lib.addItem(it)
             if t.id == select_id:
-                self.library.setCurrentItem(it)
-        self.library.blockSignals(False)
-        self._filter_library(self.search.text())
+                lib.setCurrentItem(it)
+        lib.blockSignals(False)
+        self._filter_library(self.library.search.text())
+
+    def _select_in_library(self, tid: str) -> None:
+        lib = self.library.list
+        lib.blockSignals(True)
+        for i in range(lib.count()):
+            if lib.item(i).data(ROLE_ID) == tid:
+                lib.setCurrentRow(i)
+        lib.blockSignals(False)
+
+    def _refresh_library_item(self, t: Template) -> None:
+        lib = self.library.list
+        lib.blockSignals(True)
+        for i in range(lib.count()):
+            it = lib.item(i)
+            if it.data(ROLE_ID) == t.id:
+                it.setText(t.title)
+                it.setData(ROLE_COUNT, len(t.blocks))
+                it.setToolTip(f"{t.title}\nБлоков: {len(t.blocks)}, из них кода: {len(t.code_blocks())}")
+        lib.blockSignals(False)
 
     def _filter_library(self, text: str) -> None:
         q = text.strip().lower()
-        for i in range(self.library.count()):
-            it = self.library.item(i)
-            t = self.store.get(it.data(Qt.ItemDataRole.UserRole))
+        lib = self.library.list
+        for i in range(lib.count()):
+            it = lib.item(i)
+            t = self.store.get(it.data(ROLE_ID))
             hay = t.title.lower() if t else ""
             it.setHidden(bool(q) and q not in hay)
 
     def _library_menu(self, pos) -> None:
-        it = self.library.itemAt(pos)
+        lib = self.library.list
+        it = lib.itemAt(pos)
         if not it:
             return
-        t = self.store.get(it.data(Qt.ItemDataRole.UserRole))
+        t = self.store.get(it.data(ROLE_ID))
         m = QMenu(self)
-        m.addAction("Открыть", lambda: self.open_template(t.id))
-        m.addAction("Переименовать", lambda: self.library.editItem(it))
-        m.addAction("Дублировать", lambda: self._duplicate(t))
+        m.addAction(icons.icon("file-code"), "Открыть", lambda: self.open_template(t.id))
+        m.addAction(icons.icon("pencil"), "Переименовать", lambda: lib.editItem(it))
+        m.addAction(icons.icon("copy"), "Дублировать", lambda: self._duplicate(t))
         m.addSeparator()
-        m.addAction("Экспорт в .ipynb…", lambda: self.export_template(t, "ipynb"))
-        m.addAction("Экспорт в .json…", lambda: self.export_template(t, "json"))
+        m.addAction(icons.icon("export"), "Экспорт в .ipynb…", lambda: self.export_template(t, "ipynb"))
+        m.addAction(icons.icon("export"), "Экспорт в .json…", lambda: self.export_template(t, "json"))
         m.addSeparator()
-        m.addAction("Удалить…", lambda: self._delete_template(t))
-        m.exec(self.library.mapToGlobal(pos))
+        m.addAction(icons.icon("trash"), "Удалить…", lambda: self._delete_template(t))
+        m.exec(lib.viewport().mapToGlobal(pos))
 
     def _on_library_renamed(self, it: QListWidgetItem) -> None:
-        t = self.store.get(it.data(Qt.ItemDataRole.UserRole))
+        t = self.store.get(it.data(ROLE_ID))
         title = it.text().strip()
+        if t and not title:   # стёрли название целиком — вернуть прежнее, а не оставить пустую строку
+            self._refresh_library_item(t)
+            return
         if t and title and title != t.title:
             t.title = title
-            self._sync_tab_titles()
+            v = self.views.get(t.id)
+            if v:
+                v.refresh_header()
             self._touch()
-
-    def _rename_tab(self, index: int) -> None:
-        view = self.tabs.widget(index)
-        if not isinstance(view, TemplateView):
-            return
-        title, ok = QInputDialog.getText(self, "Переименовать", "Название образца:", text=view.template.title)
-        if ok and title.strip():
-            view.template.title = title.strip()
-            self._sync_tab_titles()
-            self._fill_library(view.template.id)
-            self._touch()
-
-    def _sync_tab_titles(self) -> None:
-        for i in range(self.tabs.count()):
-            v = self.tabs.widget(i)
-            if isinstance(v, TemplateView):
-                self.tabs.setTabText(i, v.template.title)
-                self.tabs.setTabToolTip(i, v.template.title)
-
-    def view_for(self, tid: str) -> TemplateView | None:
-        for i in range(self.tabs.count()):
-            v = self.tabs.widget(i)
-            if isinstance(v, TemplateView) and v.template.id == tid:
-                return v
-        return None
 
     def current_view(self) -> TemplateView | None:
-        v = self.tabs.currentWidget()
+        v = self.stack.currentWidget()
         return v if isinstance(v, TemplateView) else None
 
     def open_template(self, tid: str, activate: bool = True) -> TemplateView | None:
-        v = self.view_for(tid)
+        v = self.views.get(tid)
         if v is None:
             t = self.store.get(tid)
             if not t:
                 return None
             v = TemplateView(t)
-            v.zoom_changed.connect(lambda z: self.statusBar().showMessage(f"Масштаб блока: {z}%", 1500))
+            v.step_pointer = self._step_pointer
+            v.zoom_changed.connect(lambda z: self._notify(f"Масштаб блока: {z} %"))
             v.changed.connect(self._touch)
-            v.armed_changed.connect(lambda _bid, v=v: self._on_armed(v))
-            self.tabs.addTab(v, t.title)
-            self._sync_tab_titles()
+            v.armed_changed.connect(lambda _bid: self._update_armed_label())
+            v.steps_changed.connect(self._on_steps_changed)
+            v.step_pointer_requested.connect(self._set_step_pointer)
+            v.apply_step_mode(self.settings.print_mode == MODE_STEPS)
+            self.views[tid] = v
+            self.stack.addWidget(v)
         if activate:
-            self.tabs.setCurrentWidget(v)
+            # первый виджет в пустом стеке становится текущим сам — поэтому выделение и пульт обновляем всегда
+            if self.stack.currentWidget() is not v:
+                self.stack.setCurrentWidget(v)
+            self._select_in_library(tid)
+            self._update_armed_label()
         return v
+
+    def _close_view(self, tid: str) -> None:
+        v = self.views.pop(tid, None)
+        if v is None:
+            return
+        if self.job and self.job["tid"] == tid and self.engine.state in BUSY:   # и «ждёт Enter»
+            self.cmd_stop()
+        self.stack.removeWidget(v)
+        v.deleteLater()
 
     # ---- масштаб блока (у каждого блока свой)
     def _target_block(self) -> BlockWidget | None:
@@ -568,30 +591,11 @@ class MainWindow(QMainWindow):
         if v:
             v.reset_zoom()
 
-    def close_tab(self, index: int) -> None:
-        v = self.tabs.widget(index)
-        if v is None:
-            return
-        if isinstance(v, TemplateView) and self.job and self.job["tid"] == v.template.id \
-                and self.engine.state in (RUNNING, COUNTDOWN, PAUSED):
-            self.cmd_stop()
-        self.tabs.removeTab(index)
-        v.deleteLater()
-        self._update_armed_label()
-
-    def _goto_tab(self, i: int) -> None:
-        if 0 <= i < self.tabs.count():
-            self.tabs.setCurrentIndex(i)
-
-    def _on_tab_changed(self, _i: int) -> None:
-        v = self.current_view()
-        if v:
-            self.library.blockSignals(True)
-            for i in range(self.library.count()):
-                if self.library.item(i).data(Qt.ItemDataRole.UserRole) == v.template.id:
-                    self.library.setCurrentRow(i)
-            self.library.blockSignals(False)
-        self._update_armed_label()
+    def _goto_template(self, i: int) -> None:
+        visible = [self.library.list.item(k) for k in range(self.library.list.count())
+                   if not self.library.list.item(k).isHidden()]
+        if 0 <= i < len(visible):
+            self.open_template(visible[i].data(ROLE_ID))
 
     def new_template(self) -> None:
         title, ok = QInputDialog.getText(self, "Новый образец", "Название (например, «Занятие 3. Циклы»):")
@@ -614,12 +618,15 @@ class MainWindow(QMainWindow):
                                 "(Резервная копия прошлой версии базы — data/templates.json.bak)") \
                 != QMessageBox.StandardButton.Yes:
             return
-        v = self.view_for(t.id)
-        if v:
-            self.close_tab(self.tabs.indexOf(v))
+        cur = self.current_view()
+        was_current = cur is not None and cur.template.id == t.id
+        self._close_view(t.id)
         self.store.remove(t)
         self._touch()
-        self._fill_library()
+        self._fill_library("" if was_current or cur is None else cur.template.id)
+        if was_current and self.store.templates:
+            self.open_template(self.store.templates[0].id)
+        self._update_armed_label()
 
     def import_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -691,89 +698,308 @@ class MainWindow(QMainWindow):
         v = self.current_view()
         if v:
             v.template.updated = time.time()
-        self._update_armed_label()
+            self._refresh_library_item(v.template)
+        if self.job and self.engine.state in BUSY and self._find_block(self.job["bid"])[1] is None:
+            self.cmd_stop()   # блок, который сейчас печатается, удалили — не допечатывать то, чего уже нет
+        # пульт и суфлёр — чуть позже, а не на каждое нажатие клавиши: в большом блоке это заметно
+        self._label_timer.start()
         self._save_timer.start()
 
     def _save_store(self) -> None:
         try:
             self.store.save()
         except OSError as e:
-            self._notify(f"Не удалось сохранить образцы: {e}", True)
+            self._notify(f"Не удалось сохранить образцы: {e}", warn=True)
+
+    def _ensure_samples(self) -> None:
+        """Пример пошагового урока — один раз (и новым пользователям, и после обновления)."""
+        from ..storage import STEPS_SAMPLE_ID
+        if STEPS_SAMPLE_ID not in self.settings.samples_seen:
+            self.store.insert(steps_sample_template())
+            self.settings.samples_seen.append(STEPS_SAMPLE_ID)
+            self._save_store()
+            self._save_settings()
+
+    def _add_steps_sample(self) -> None:
+        t = self.store.insert(steps_sample_template())
+        self._touch()
+        self._fill_library(t.id)
+        self.open_template(t.id)
 
     def _restore_session(self) -> None:
         s = self.settings
+        self._ensure_samples()
         if s.window_geometry:
             self.restoreGeometry(QByteArray.fromBase64(s.window_geometry.encode()))
-        if s.splitter_state:
-            self.split.restoreState(QByteArray.fromBase64(s.splitter_state.encode()))
         self._fill_library(s.current_tab)
-        for tid in s.open_tabs:
-            self.open_template(tid, activate=False)
-        if self.tabs.count() == 0 and self.store.templates:
-            self.open_template(self.store.templates[0].id)
-        cur = self.view_for(s.current_tab)
-        if cur:
-            self.tabs.setCurrentWidget(cur)
+        tid = s.current_tab if self.store.get(s.current_tab) else \
+            (self.store.templates[0].id if self.store.templates else "")
+        if tid:
+            self.open_template(tid)
         self._update_armed_label()
 
     def _save_session(self) -> None:
         s = self.settings
         s.window_geometry = bytes(self.saveGeometry().toBase64()).decode()
-        s.splitter_state = bytes(self.split.saveState().toBase64()).decode()
-        s.open_tabs = [self.tabs.widget(i).template.id for i in range(self.tabs.count())
-                       if isinstance(self.tabs.widget(i), TemplateView)]
         v = self.current_view()
         s.current_tab = v.template.id if v else ""
+        s.open_tabs = [s.current_tab] if s.current_tab else []
         s.save()
 
     # ================================================================ печать
     def _armed(self):
-        """Активный блок текущей вкладки → (view, block) или None."""
+        """Активный блок открытого образца → (view, block) или None."""
         v = self.current_view()
         if not v or not v.template.active_block:
             return None
         block = v.template.find_block(v.template.active_block)
         return (v, block) if block else None
 
-    def _on_armed(self, v: TemplateView) -> None:
+    def _find_block(self, bid: str) -> tuple[Template | None, Block | None]:
+        for t in self.store.templates:
+            b = t.find_block(bid)
+            if b:
+                return t, b
+        return None, None
+
+    def _code_number(self, t: Template, block: Block) -> int:
+        ids = [b.id for b in t.code_blocks()]
+        return ids.index(block.id) + 1 if block.id in ids else 0
+
+    # ---- печать по шагам: какой шаг следующий
+    @staticmethod
+    def _block_steps(block: Block) -> list[int]:
+        return S.step_numbers(block.steps, block.text.count("\n") + 1)
+
+    def _step_pointer(self, bid: str) -> int | None:
+        """Какой шаг блока печатать следующим; None — все шаги напечатаны."""
+        _t, b = self._find_block(bid)
+        if not b:
+            return None
+        nums = self._block_steps(b)
+        if bid not in self.step_next:
+            return nums[0]
+        k = self.step_next[bid]
+        if k is None:
+            return None
+        return next((n for n in nums if n >= k), None)   # разметку поменяли — ближайший следующий
+
+    def _step_index(self, block: Block, k: int | None) -> tuple[int, int]:
+        nums = self._block_steps(block)
+        return (nums.index(k) + 1 if k in nums else len(nums)), len(nums)
+
+    def _set_step_pointer(self, bid: str, k: int | None) -> None:
+        if self.job and self.job["bid"] == bid and self.engine.state in BUSY:
+            self.cmd_stop()
+        self.step_next[bid] = k
+        self._invalidate_job_if_idle()
+        self._refresh_step_views()
         self._update_armed_label()
 
-    def _update_armed_label(self) -> None:
+    def _refresh_step_views(self) -> None:
+        on = self.settings.print_mode == MODE_STEPS
+        for v in self.views.values():
+            v.apply_step_mode(on)
+
+    def _on_steps_changed(self, _bid: str) -> None:
+        self._invalidate_job_if_idle()
+        if self.settings.print_mode == MODE_STEPS:
+            self._refresh_step_views()
+        self._label_timer.start()
+
+    def _lines_of(self, block: Block) -> list:
+        """Разбор блока по шагам (с учётом «Без комментариев»). Запоминается: пульт и суфлёр спрашивают
+        его на каждое изменение, а в большом блоке разбор не бесплатный."""
+        strip = self.settings.strip_comments
+        key = (block.id, block.text, tuple(block.steps), block.lang, strip)
+        if self._analysis is None or self._analysis[0] != key:
+            self._analysis = (key, S.analyze(block.text, block.steps, block.lang, strip))
+        return self._analysis[1]
+
+    def _advance_step(self, bid: str, k: int) -> int | None:
+        """Шаг k напечатан → указатель на следующий. Возвращает его (None — шаги кончились)."""
+        _t, b = self._find_block(bid)
+        nums = self._block_steps(b) if b else []
+        nxt = next((n for n in nums if n > k), None)
+        self.step_next[bid] = nxt
+        self._refresh_step_views()
+        return nxt
+
+    def cmd_step_back(self) -> None:
+        """Шаг назад без печати: следующим снова будет предыдущий шаг (чтобы переснять его)."""
+        if self.settings.print_mode != MODE_STEPS:
+            self._notify("«Шаг назад» работает в режиме «По шагам».")
+            return
         a = self._armed()
         if not a:
-            self.armed_lbl.setText("<span style='color:gray'>Нет активного блока кода — щёлкните по блоку кода</span>")
+            return
+        _v, block = a
+        if self.engine.state in BUSY:
+            self.cmd_stop()
+        nums = self._block_steps(block)
+        k = self._step_pointer(block.id)
+        prev = nums[-1] if k is None else next((n for n in reversed(nums) if n < k), nums[0])
+        self._set_step_pointer(block.id, prev)
+        i, n = self._step_index(block, prev)
+        self._notify(f"Следующим будет шаг {i} из {n}. Если он уже напечатан — сотрите его в редакторе.",
+                     tray=not self.isActiveWindow())
+
+    # ---- пульт и суфлёр
+    def _update_armed_label(self) -> None:
+        if self.engine.state in BUSY and self.job:
+            self._refresh_prompter()
+            return   # во время печати на пульте — ход печати
+        a = self._armed()
+        if not a:
+            self.strip.set_info("Нет активного блока кода — щёлкните по блоку кода")
+            self.strip.set_progress(0, 0, 0)
+            self._set_title_status()
+            self._refresh_prompter()
             return
         v, block = a
-        n = [b.id for b in v.template.code_blocks()].index(block.id) + 1
-        text, _ = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
-        if self.settings.strip_comments:
-            text, _ = strip_comments(text, block.lang)
-        part = "выделенные строки" if block.sel else "весь блок"
-        if self.settings.strip_comments:
-            part += ", без комментариев"
-        lines = text.count("\n") + 1 if text else 0
-        self.armed_lbl.setText(f"Печатать: <b>{v.template.title}</b> · {block.display_title(n)} · {part} "
-                               f"({lines} стр., {len(text)} симв.)")
+        title = f"<b style='color:{theme.c('text').name()}'>{block.display_title(self._code_number(v.template, block))}</b>"
+        mode = self.settings.print_mode
+        if mode == MODE_STEPS:
+            k = self._step_pointer(block.id)
+            nums = self._block_steps(block)
+            if k is None:
+                self.strip.set_info(f"По шагам: {title} · все шаги напечатаны · "
+                                    f"{self.settings.hotkey_restart or 'кнопка ⟲'} — сначала")
+                self.strip.set_progress(len(nums), len(nums), 1.0, "шаг.")
+            else:
+                i, n = self._step_index(block, k)
+                lines = self._lines_of(block)
+                count = sum(1 for sl in lines if sl.step == k and sl.typed is not None)
+                self.strip.set_info(f"Дальше: шаг {i} из {n} · {title} · строк: {count}")
+                self.strip.set_progress(i - 1, n, (i - 1) / max(1, n), "шаг.")
+        else:
+            text, _ = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
+            if self.settings.strip_comments:
+                text, _ = strip_comments(text, block.lang)
+            part = "выделенные строки" if block.sel else "весь блок"
+            if self.settings.strip_comments:
+                part += ", без комментариев"
+            if mode == MODE_LINES:
+                part = "по строкам, " + part
+            lines = text.count("\n") + 1 if text else 0
+            self.strip.set_info(f"Печатать: {title} · {part} · {len(text)} симв.")
+            self.strip.set_progress(0, lines, 0)
+        self._set_title_status()
+        self._refresh_prompter()
 
+    def _refresh_prompter(self) -> None:
+        """Суфлёр: что дальше и что сказать. Только для «По строкам» и «По шагам»."""
+        s = self.settings
+        a = self._armed()
+        if not s.show_prompter or s.print_mode == MODE_BLOCK or not a:
+            self.prompter.hide()
+            return
+        v, block = a
+        name = block.display_title(self._code_number(v.template, block))
+        busy = self.engine.state in BUSY and self.job and self.job["bid"] == block.id
+        if s.print_mode == MODE_STEPS:
+            k = self.job["step"] if busy and self.job.get("kind") == MODE_STEPS else self._step_pointer(block.id)
+            if k is None:
+                self.prompter.show_content(f"{name} · все шаги напечатаны", f"{s.hotkey_restart} — сначала",
+                                           [], [])
+                return
+            lines = self._lines_of(block)
+            i, n = self._step_index(block, k)
+            say = S.narration(block.text, lines, k, block.lang)
+            code, hidden = S.preview(lines, k)
+            head = "Печатается" if busy else "Дальше"
+            self.prompter.show_content(f"{head}: шаг {i} из {n} · {name}",
+                                       "" if busy else f"{s.hotkey_toggle} — напечатать шаг", say, code, hidden)
+            return
+        # по строкам: следующая непустая строка и комментарии перед ней
+        job = self.job if busy and self.job.get("kind") == MODE_LINES else self._job_for_armed()
+        if not job or job.get("kind") != MODE_LINES:
+            self.prompter.hide()
+            return
+        text = job["text"]
+        rows = text.split("\n")
+        pos = getattr(self, "_last_pos", 0) if busy else 0
+        cur = text.count("\n", 0, pos) if busy and pos else -1
+        nxt = next((r for r in range(cur + 1, len(rows)) if rows[r].strip()), None)
+        if nxt is None:
+            self.prompter.show_content(f"{name} · строки кончились", "", [], [])
+            return
+        starts = [0]
+        for r in rows[:-1]:
+            starts.append(starts[-1] + len(r) + 1)
+
+        def src(i: int) -> int:   # позиция в тексте задания → в тексте блока
+            omap = job["omap"]
+            if omap is not None:
+                i = omap[i] if i < len(omap) else job["src_len"]
+            return job["base"] + i
+
+        def row_start(r: int) -> int:
+            """Начало строки r задания в тексте блока. Через «\\n» перед ней: он стоит сразу перед
+            этой строкой исходника — после вырезанных строк-комментариев, а не перед ними."""
+            if r == 0:
+                return src(0) if rows[0] else job["base"]
+            return src(starts[r] - 1) + 1
+
+        def line_end(i: int) -> int:
+            e = block.text.find("\n", i)
+            return len(block.text) if e < 0 else e
+
+        # что сказать: строки-комментарии после напечатанной строки (её хвостовой комментарий уже звучал)
+        # и до конца следующей — вместе с её хвостовым комментарием, как и по шагам
+        a_src = line_end(row_start(cur)) if cur >= 0 else job["base"]
+        b_end = line_end(row_start(nxt))
+        say = [comment_text(block.text[x:y]) for x, y in comment_spans(block.text, block.lang)
+               if a_src <= x < b_end] if s.strip_comments else []
+        hint = "" if busy else f"{s.hotkey_toggle} — начать"
+        if busy and self.engine.state == LINE_WAIT:
+            hint = f"Enter или {s.hotkey_toggle} — напечатать"
+        self.prompter.show_content(f"Дальше: строка {nxt + 1} из {len(rows)} · {name}", hint,
+                                   [t for t in say if t], [rows[nxt]])
+
+    # ---- задание на печать
     def _job_for_armed(self) -> dict | None:
         a = self._armed()
         if not a:
             return None
         v, block = a
+        mode = self.settings.print_mode
+        if mode == MODE_STEPS:
+            k = self._step_pointer(block.id)
+            if k is None or not block.text.strip():   # пустой блок — «нечего печатать», а не «шаг без кода»
+                return None
+            text, st, lang = block.text, list(block.steps), block.lang
+
+            def build(s: Settings, text=text, st=st, lang=lang, k=k):
+                return S.build_step_units(S.analyze(text, st, lang, s.strip_comments), k, s)
+            job = {"kind": MODE_STEPS, "tid": v.template.id, "bid": block.id, "step": k, "base": 0, "text": text,
+                   "omap": None, "src_len": len(text), "builder": build,
+                   "key": (tuple(st), k, self.settings.strip_comments)}
+            if not build(self.settings):
+                job["empty"] = True   # в шаге только комментарии — печатать нечего, это «слова»
+            return job
         text, base = typing_slice(block.text, block.sel, self.settings.selection_whole_lines)
+        src_len = len(text)
+        omap = None
         if self.settings.strip_comments:
-            text, _ = strip_comments(text, block.lang)
+            text, omap = strip_comments(text, block.lang)
         if not text.strip():
             return None
-        return {"tid": v.template.id, "bid": block.id, "base": base, "text": text}
+        builder = None
+        if mode == MODE_LINES:
+            def builder(s: Settings, text=text):
+                return build_units(text, s, line_wait=True)
+        return {"kind": mode, "tid": v.template.id, "bid": block.id, "base": base, "text": text, "omap": omap,
+                "src_len": src_len, "builder": builder, "key": None}
 
     def _same_job(self, job: dict | None) -> bool:
-        return bool(job and self.job and all(job[k] == self.job[k] for k in ("tid", "bid", "base", "text")))
+        return bool(job and self.job and all(job.get(k) == self.job.get(k)
+                                             for k in ("kind", "tid", "bid", "base", "text", "key")))
 
     def _load_job(self, job: dict) -> None:
-        self._reset_progress()
+        self._clear_progress()
         self.job = job
-        self.engine.load(job["text"], job["bid"])
+        self.engine.load(job["text"], job["bid"], job.get("builder"))
 
     def _invalidate_job_if_idle(self) -> None:
         if self.engine.state in (IDLE, FINISHED):
@@ -787,17 +1013,43 @@ class MainWindow(QMainWindow):
             return 0.0, s.button_countdown_s if countdown is None else countdown
         return s.hotkey_start_delay_ms / 1000, countdown or 0
 
+    def _skip_empty_step(self, job: dict) -> None:
+        """Шаг без кода (одни комментарии-слова): отмечаем сказанным и переходим к следующему."""
+        _t, b = self._find_block(job["bid"])
+        i, n = self._step_index(b, job["step"]) if b else (0, 0)
+        nxt = self._advance_step(job["bid"], job["step"])
+        self._update_armed_label()
+        tail = f" Дальше — шаг {i + 1}." if nxt is not None else " Шаги кончились."
+        self._notify(f"Шаг {i} из {n} — только слова, кода в нём нет.{tail}", tray=not self.isActiveWindow())
+
     def cmd_toggle(self, from_button: bool = False, countdown: int | None = None) -> None:
         st = self.engine.state
+        if st == LINE_WAIT:
+            # по строкам: хоткей или кнопка = «следующая строка» — как продолжение после паузы
+            # (задержка хоткея, с кнопки — отсчёт и сворачивание окна, чтобы фокус вернулся в редактор)
+            self.engine.continue_line(False, *self._start_params(from_button, countdown))
+            return
         if st in (RUNNING, COUNTDOWN):
             self.engine.pause()
             return
+        a = self._armed()
+        if self.settings.print_mode == MODE_STEPS and a and self._step_pointer(a[1].id) is None \
+                and st != PAUSED:
+            self._notify(f"Все шаги блока напечатаны. {self.settings.hotkey_restart or 'Кнопка ⟲'} — сначала, "
+                         f"{self.settings.hotkey_next_block or 'выбор блока'} — следующий блок.",
+                         tray=not self.isActiveWindow())
+            return
         job = self._job_for_armed()
         if job is None:
-            self._notify("Нечего печатать: выберите (щёлкните) непустой блок кода.", True)
+            self._notify("Нечего печатать: выберите (щёлкните) непустой блок кода.", warn=True)
             return
         if st == PAUSED and self._same_job(job):
             self.engine.resume(*self._start_params(from_button, countdown))
+            return
+        if job.get("empty"):
+            if st == PAUSED:
+                self.cmd_stop()   # на паузе стоит другое задание — его уже не продолжить
+            self._skip_empty_step(job)
             return
         if not self._same_job(job) or st == FINISHED or st == PAUSED:
             if st == PAUSED:
@@ -806,17 +1058,26 @@ class MainWindow(QMainWindow):
         self.engine.start(*self._start_params(from_button, countdown))
 
     def cmd_restart(self, from_button: bool = False) -> None:
+        a = self._armed()
+        if self.settings.print_mode == MODE_STEPS and a:
+            self.step_next[a[1].id] = self._block_steps(a[1])[0]   # по шагам «сначала» — с первого шага
+            self._refresh_step_views()
         job = self._job_for_armed()
         if job is None:
-            self._notify("Нечего печатать: выберите (щёлкните) непустой блок кода.", True)
+            self._notify("Нечего печатать: выберите (щёлкните) непустой блок кода.", warn=True)
+            return
+        if job.get("empty"):
+            self.cmd_stop()
+            self._skip_empty_step(job)
             return
         self._load_job(job)
         self.engine.restart(*self._start_params(from_button))
 
     def cmd_stop(self) -> None:
         self.engine.stop()
-        self._reset_progress()
+        self._clear_progress()
         self.job = None
+        self._update_armed_label()
 
     def cmd_block(self, d: int) -> None:
         v = self.current_view()
@@ -828,21 +1089,26 @@ class MainWindow(QMainWindow):
         cur = v.template.active_block
         i = ids.index(cur) if cur in ids else -1
         j = max(0, min(len(ids) - 1, i + d))
-        if self.engine.state in (RUNNING, COUNTDOWN, PAUSED):
+        if self.engine.state in BUSY:
             self.cmd_stop()
         v.go_to_block(ids[j])
         self._notify(f"Активный блок: {v.template.find_block(ids[j]).display_title(j + 1)}"
                      f" ({j + 1} из {len(ids)})", tray=not self.isActiveWindow())
 
     def cmd_next_tab(self, d: int = 1) -> None:
-        n = self.tabs.count()
-        if n:
-            if self.engine.state in (RUNNING, COUNTDOWN):
-                self.engine.pause()
-            self.tabs.setCurrentIndex((self.tabs.currentIndex() + d) % n)
-            v = self.current_view()
-            if v and not self.isActiveWindow():
-                self._notify(f"Образец: {v.template.title}", tray=True)
+        lib = self.library.list
+        rows = [k for k in range(lib.count()) if not lib.item(k).isHidden()]
+        if not rows:
+            return
+        if self.engine.state in (RUNNING, COUNTDOWN):
+            self.engine.pause()
+        cur = lib.currentRow()
+        i = rows.index(cur) if cur in rows else -1
+        it = lib.item(rows[(i + d) % len(rows)])
+        self.open_template(it.data(ROLE_ID))
+        v = self.current_view()
+        if v and not self.isActiveWindow():
+            self._notify(f"Образец: {v.template.title}", tray=True)
 
     def _on_hotkey(self, action: str) -> None:
         if action == "hotkey_toggle":
@@ -857,78 +1123,157 @@ class MainWindow(QMainWindow):
             self.cmd_block(-1)
         elif action == "hotkey_next_tab":
             self.cmd_next_tab(+1)
+        elif action == "hotkey_step_back":
+            self.cmd_step_back()
 
     # ---- сигналы движка
     def _on_guard(self, kind: str) -> None:
-        if self.engine.state == RUNNING:
-            self.engine.pause("нажата клавиша" if kind == "key" else "клик мышью")
-            # без всплывающего уведомления Windows: оно со звуком, а пауза и так видна (оранжевый значок)
-            self.statusBar().showMessage("Пауза: вы нажали клавишу" if kind == "key"
-                                         else "Пауза: вы кликнули мышью", 7000)
+        if self.engine.state != RUNNING:
+            # защита осталась включённой, хотя печать уже стоит (запоздалый сигнал) — снять, иначе
+            # хук глотал бы все клавиши пользователя
+            self.guard.disarm()
+            return
+        self.engine.pause("нажата клавиша" if kind == "key" else "клик мышью")
+        # без всплывающего уведомления Windows: оно со звуком, а пауза и так видна (значок в трее)
+        self._notify("Пауза: вы нажали клавишу." if kind == "key" else "Пауза: вы кликнули мышью.",
+                     tray=False, quiet=True)
 
-    def _on_state(self, st: str) -> None:
+    def _on_target(self, exe: str) -> None:
+        self._target = app_name(exe)
+
+    def _on_state(self, _signalled: str = "") -> None:
+        # сигналы из потока печати приходят с опозданием: после «Стоп» может прийти запоздалое
+        # «Печатает». Поэтому — только текущее состояние движка, иначе защита включится у стоящей печати
+        st = self.engine.state
         if st == RUNNING and self.settings.guard_enabled:
             self.guard.arm()
         else:
             self.guard.disarm()
-        color = STATE_COLORS.get(st, "#888")
-        self.state_lbl.setText(f"<b style='color:{color}'>● {STATE_TEXT.get(st, st)}</b>")
-        self.btn_toggle.setText({RUNNING: "⏸ Пауза", COUNTDOWN: "⏸ Пауза",
-                                 PAUSED: "▶ Продолжить"}.get(st, "▶ Старт"))
-        icon = self.icons.get(st, self.icons[IDLE])
-        self.tray.setIcon(icon)
-        self.setWindowIcon(icon)
+        self.guard.watch_enter(st == LINE_WAIT)   # по строкам: ждём Enter пользователя
+        self.strip.set_state(st)
+        kind = logo.STATE_KIND.get(st, logo.IDLE)
+        self.tray.setIcon(self.tray_icons[kind])
         self.tray.setToolTip(f"{APP_NAME}: {STATE_TEXT.get(st, st)}")
-        self.setWindowTitle(f"{APP_NAME} {__version__} — {STATE_TEXT.get(st, st)}")
+        if st == FINISHED and self.job:
+            self._clear_progress()   # подсветка в блоке больше не нужна, а на пульте — итог
+            lines = self.job["text"].count("\n") + 1
+            self.strip.set_progress(lines, lines, 1.0)
+            self.strip.set_info(f"Напечатано → {self._target}" if self._target else "Напечатано")
+        elif st in (IDLE, FINISHED):
+            if st == IDLE:
+                self._clear_progress()
+            self._update_armed_label()
+        else:
+            self._show_job_progress()
+            self._refresh_prompter()
+        self._set_title_status()
+
+    def _set_title_status(self, extra: str = "") -> None:
+        st = self.engine.state
+        text = STATE_TEXT.get(st, st)
+        if self.job and st in BUSY:
+            t, b = self._find_block(self.job["bid"])
+            if b and t:
+                text += f" · {b.display_title(self._code_number(t, b))}"
+                if self.job.get("kind") == MODE_STEPS:
+                    i, n = self._step_index(b, self.job["step"])
+                    text += f" · шаг {i} из {n}"
+                elif self._line_info:
+                    text += f" · строка {self._line_info[0]} из {self._line_info[1]}"
+        elif st == IDLE and self.settings.hotkey_toggle:
+            text += f" · {self.settings.hotkey_toggle} — старт"
+        if extra:
+            text = extra
+        self.titlebar.set_status(text, STATE_TOKENS.get(st, "ok"))
+        self.setWindowTitle(f"{APP_NAME} — {text}")
+
+    _line_info: tuple[int, int] | None = None
 
     def _on_progress(self, pos: int, total: int) -> None:
-        self.progress.setMaximum(max(1, total))
-        self.progress.setValue(pos)
+        self._last_pos = pos
+        # загрузка задания тоже шлёт progress(0) — блок гасим только когда печать действительно идёт:
+        # если старт сорвётся (курсор в своём окне и т. п.), состояние так и останется «Готов»
+        if self.engine.state in BUSY:
+            self._show_job_progress()
 
-    def _reset_progress(self) -> None:
-        self.progress.setValue(0)
+    def _show_job_progress(self) -> None:
+        job = self.job
+        if not job:
+            return
+        text = job["text"]
+        pos = max(0, min(getattr(self, "_last_pos", 0), len(text)))
+        v = self.views.get(job["tid"])
+        w = v.code_widget(job["bid"]) if v else None
+        where = f"→ {self._target}" if self._target else ""
+        if job.get("kind") == MODE_STEPS:
+            _t, b = self._find_block(job["bid"])
+            i, n = self._step_index(b, job["step"]) if b else (1, 1)
+            self._line_info = None
+            self.strip.set_progress(i, n, (i - 0.5) / max(1, n), "шаг.")
+            self.strip.set_info(f"{where} · шаг {i} из {n}" if where else f"шаг {i} из {n}")
+            if w:
+                w.set_step_progress(job["step"], pos)
+        else:
+            total_lines = text.count("\n") + 1
+            line = text.count("\n", 0, pos) + 1
+            self._line_info = (line, total_lines)
+            self.strip.set_progress(line if pos else 0, total_lines, pos / max(1, len(text)))
+            if self.engine.state == LINE_WAIT:
+                where = f"{where} · Enter — следующая строка" if where else "Enter — следующая строка"
+            self.strip.set_info(where)
+            # подсветка в блоке: напечатанное — ярко, остальное — приглушённо
+            if w:
+                omap = job["omap"]
+                src = (omap[pos] if pos < len(omap) else job["src_len"]) if omap is not None else pos
+                w.set_progress(job["base"], job["base"] + src, job["base"] + job["src_len"])
+        self._set_title_status()
+
+    def _clear_progress(self) -> None:
+        self._last_pos = 0
+        self._line_info = None
+        for v in self.views.values():
+            v.clear_progress()
 
     def _on_countdown(self, n: int) -> None:
-        if n:
-            self.statusBar().showMessage(f"Старт через {n}… Поставьте курсор в нужное окно.", 1500)
+        if n and self.engine.state == COUNTDOWN:   # после паузы отсчёт на пульте не возвращаем
+            self.strip.set_state(COUNTDOWN, n)
+            self._set_title_status(f"Старт через {n}… Поставьте курсор в нужное окно")
             self.tray.setToolTip(f"{APP_NAME}: старт через {n}")
 
     def _on_finished(self) -> None:
-        self.statusBar().showMessage("Набор завершён.", 4000)
-        if self.settings.auto_advance:
-            v = self.view_for(self.job["tid"]) if self.job else None
+        job = self.job
+        if job and job.get("kind") == MODE_STEPS:
+            _t, b = self._find_block(job["bid"])
+            i, n = self._step_index(b, job["step"]) if b else (0, 0)
+            nxt = self._advance_step(job["bid"], job["step"])
+            self.job = None
+            self._update_armed_label()
+            if nxt is not None:
+                self._notify(f"Шаг {i} из {n} напечатан. Дальше — шаг {i + 1}.", quiet=True)
+                return
+            self._notify(f"Все {n} шаг(ов) напечатаны.", quiet=True)
+        else:
+            self._notify("Набор завершён.", quiet=True)
+        if self.settings.auto_advance and job:
+            v = self.views.get(job["tid"])
             if v and v is self.current_view():
                 ids = [b.id for b in v.template.code_blocks()]
-                if self.job["bid"] in ids and ids.index(self.job["bid"]) + 1 < len(ids):
+                if job["bid"] in ids and ids.index(job["bid"]) + 1 < len(ids):
                     QTimer.singleShot(400, lambda: self.cmd_block(+1))
 
-    def _notify(self, text: str, tray: bool = False) -> None:
-        self.statusBar().showMessage(text, 7000)
-        if tray or not self.isActiveWindow():
-            self.tray.showMessage(APP_NAME, text, self.icons[PAUSED], 3000)
+    def _notify(self, text: str, tray: bool = False, warn: bool = False, quiet: bool = False) -> None:
+        self.toast.show_message(text, warn=warn)
+        if not quiet and (tray or not self.isActiveWindow()):
+            self.tray.showMessage(APP_NAME, text, self.tray_icons[logo.PAUSED if warn else logo.IDLE], 3000)
 
     # ================================================================ прочее
     def _show_window(self) -> None:
-        self.showNormal()
+        if self.isMaximized():
+            self.showMaximized()
+        else:
+            self.showNormal()
         self.raise_()
         self.activateWindow()
-
-    def show_help(self) -> None:
-        s = self.settings
-        QMessageBox.information(self, "Как пользоваться", f"""\
-<h3>Быстрый старт</h3>
-<ol>
-<li>Слева выберите образец (или <b>Импорт</b> из .ipynb). Образец — это лента блоков: условия, пояснения и код.</li>
-<li>Щёлкните по блоку кода — он станет <b>активным</b> (зелёная рамка).
-Выделите строки, если нужно напечатать только их.</li>
-<li>Перейдите в целевое окно (Блокнот, VS Code, браузер, Jupyter), поставьте курсор.</li>
-<li>Нажмите <b>{s.hotkey_toggle}</b> — начнётся набор. Ещё раз — пауза, ещё раз — продолжение.</li>
-</ol>
-<p><b>{s.hotkey_restart or '—'}</b> — начать сначала · <b>{s.hotkey_stop or '—'}</b> — стоп ·
-<b>{s.hotkey_next_block or '—'}</b> / <b>{s.hotkey_prev_block or '—'}</b> — следующий / предыдущий блок кода.</p>
-<p>Профиль <b>IDE</b> убирает автоотступы и автозакрытые скобки редактора.
-Для Блокнота выберите профиль <b>Блокнот</b>.</p>
-<p>Если окно сменилось во время печати — набор встанет на паузу.</p>""")
 
     # ================================================================ панель задач
     def set_taskbar_icon(self, icon_path: str) -> None:
@@ -950,7 +1295,7 @@ class MainWindow(QMainWindow):
 
     # ================================================================ обновления
     def _busy_typing(self) -> bool:
-        return self.engine.state in (RUNNING, COUNTDOWN, PAUSED)
+        return self.engine.state in BUSY
 
     def _auto_check_updates(self) -> None:
         # «при каждом запуске» — только первая проверка; иначе таймер раз в час смотрит, не пора ли
@@ -962,16 +1307,18 @@ class MainWindow(QMainWindow):
 
     def check_updates(self, manual: bool = True) -> None:
         if manual:
-            self.statusBar().showMessage("Проверка обновлений…", 5000)
+            self._notify("Проверка обновлений…", quiet=True)
         self.updates.check(manual)
 
     def _on_update_checked(self, rel, manual: bool) -> None:
         self.settings.update_last_check = time.time()
         self._save_settings()
+        if self.settings_win:
+            self.settings_win.refresh_update_info()
         if rel is None:
             self._show_update_button(None)
             if manual:
-                QMessageBox.information(QApplication.activeModalWidget() or self, "Обновления",
+                QMessageBox.information(QApplication.activeModalWidget() or self.settings_win or self, "Обновления",
                                         f"У вас последняя версия — {__version__}.")
             return
         if not manual and self.updates.is_skipped(rel):
@@ -982,18 +1329,18 @@ class MainWindow(QMainWindow):
         elif self.settings.update_mode in (MODE_DOWNLOAD, MODE_AUTO) and self.updates.can_install:
             self.updates.download(rel)   # сообщим, когда будет готово
         elif not self._busy_typing():
-            self._notify(f"Доступна новая версия {rel.version}. Нажмите «⬆» в строке состояния.", tray=True)
+            self._notify(f"Доступна новая версия {rel.version} — кнопка слева внизу.", tray=True)
 
     def _on_update_check_failed(self, text: str, manual: bool) -> None:
         if manual:
-            QMessageBox.warning(QApplication.activeModalWidget() or self, "Обновления", text)
+            QMessageBox.warning(QApplication.activeModalWidget() or self.settings_win or self, "Обновления", text)
 
     def _on_update_ready(self, rel) -> None:
         self._show_update_button(rel)
         if self.settings.update_mode == MODE_AUTO:
             text = f"Версия {rel.version} скачана и установится при выходе из программы."
         else:
-            text = f"Версия {rel.version} готова к установке — нажмите «⬆» в строке состояния."
+            text = f"Версия {rel.version} готова к установке — кнопка слева внизу."
         if self._busy_typing():   # не отвлекаем во время занятия
             log.info(text)
         else:
@@ -1001,14 +1348,12 @@ class MainWindow(QMainWindow):
 
     def _show_update_button(self, rel) -> None:
         if rel is None:
-            self.btn_update.hide()
+            self.library.show_update(None)
             self.tray_update.setVisible(False)
             return
         ready = bool(self.updates.staged and self.updates.staged[0].version == rel.version)
-        text = f"⬆ Обновить до {rel.version}" if ready else f"⬆ Доступна версия {rel.version}"
-        self.btn_update.setText(text)
-        self.btn_update.setToolTip("Что нового и установка")
-        self.btn_update.show()
+        text = f"Обновить до {rel.version}" if ready else f"Доступна версия {rel.version}"
+        self.library.show_update(text)
         self.tray_update.setText(text)
         self.tray_update.setVisible(True)
 
@@ -1017,7 +1362,7 @@ class MainWindow(QMainWindow):
         if rel is None:
             self.check_updates(manual=True)
             return
-        dlg = UpdateDialog(self.updates, rel, QApplication.activeModalWidget() or self)
+        dlg = UpdateDialog(self.updates, rel, QApplication.activeModalWidget() or self.settings_win or self)
         dlg.restart_requested.connect(self.install_update_and_restart)
         dlg.exec()
 
@@ -1045,11 +1390,19 @@ class MainWindow(QMainWindow):
             return
         self._notify(f"{APP_NAME} обновлён: {d.get('from')} → {d.get('to')}.", tray=True)
 
-    def show_about(self) -> None:
-        QMessageBox.about(self, "О программе", f"<h3>{APP_NAME} {__version__}</h3>"
-                          "<p>Агент для живых демонстраций кода.</p>")
-
     def closeEvent(self, e) -> None:
+        if self.settings.close_to_tray and not self._quitting and self.tray.isVisible():
+            # «закрыть» = спрятать в трей; выход — из меню логотипа или значка в трее
+            e.ignore()
+            self._save_session()
+            self.hide()
+            if self.settings_win:
+                self.settings_win.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(APP_NAME, "Программа работает в трее. Хоткеи действуют. "
+                                      "Выход — из меню значка.", self.tray_icons[logo.IDLE], 3000)
+            return
         # «установить при выходе»: скачанное обновление применяется, новая версия — со следующего запуска
         if (self.updates.staged and not self.updates.applied and not self.relaunch_requested
                 and self.settings.update_mode == MODE_AUTO):
@@ -1057,6 +1410,8 @@ class MainWindow(QMainWindow):
                 self.updates.apply_staged()
             except updater.UpdateError as err:
                 log.warning("Обновление при выходе не установлено: %s", err)
+        if self.settings_win:
+            self.settings_win.close()
         self.engine.stop()
         self._save_timer.stop()
         self._save_store()
@@ -1065,7 +1420,10 @@ class MainWindow(QMainWindow):
         self.guard.shutdown()
         self.tray.hide()
         super().closeEvent(e)
+        # приложение не выходит само при закрытии последнего окна (живёт в трее) — выходим явно
+        QTimer.singleShot(0, QApplication.quit)
 
     def quit_app(self) -> None:
+        self._quitting = True
         self.close()
         QApplication.quit()

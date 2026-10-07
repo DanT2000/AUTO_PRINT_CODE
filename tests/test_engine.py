@@ -1,0 +1,420 @@
+"""Движок печати и главное окно вместе — против эмулятора редактора. Настоящие нажатия НЕ отправляются:
+функции SendInput в autoprint.winapi подменены, защита от нажатий и глобальные хоткеи — заглушки
+(хуки клавиатуры не ставятся). Окна на экран не выводятся.
+
+    python tests/test_engine.py
+
+Проверяется: печать по шагам и по строкам целиком (профиль IDE — с автоотступом и автоскобками), хоткей
+«дальше» с ещё зажатым Ctrl, запоздалые сигналы состояния и защита, отмена печати, суфлёр по строкам.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.environ["AUTOPRINT_DATA"] = tempfile.mkdtemp(prefix="autoprint-engine-")
+
+from PySide6.QtCore import QObject, Qt, Signal  # noqa: E402
+from PySide6.QtWidgets import QApplication  # noqa: E402
+
+app = QApplication(sys.argv)
+errors: list[str] = []
+
+
+def _hook(t, v, tb) -> None:
+    errors.append("".join(traceback.format_exception(t, v, tb)))
+    print(errors[-1], file=sys.stderr)
+
+
+sys.excepthook = _hook
+
+from autoprint import steps as S  # noqa: E402
+from autoprint import winapi as W  # noqa: E402
+from autoprint.comments import comment_spans  # noqa: E402
+from autoprint.storage import (BLOCK_CODE, PROFILE_IDE, PROFILE_PLAIN, Block, Settings, Template,  # noqa: E402
+                               TemplateStore)
+from autoprint.typer import FINISHED, IDLE, LINE_WAIT, RUNNING, TypingEngine  # noqa: E402
+
+failed: list[str] = []
+
+
+def check(name: str, ok: bool, extra: str = "") -> None:
+    print(f"{'OK  ' if ok else 'FAIL'} {name}{' — ' + str(extra) if extra else ''}")
+    if not ok:
+        failed.append(name)
+
+
+# ---------------------------------------------------------------- эмулятор редактора
+
+KEYS = {W.VK_BACK: "back", W.VK_TAB: "tab", W.VK_RETURN: "enter", W.VK_ESCAPE: "esc", W.VK_END: "end",
+        W.VK_HOME: "home", W.VK_UP: "up", W.VK_DOWN: "down"}
+
+
+class Editor:
+    """Документ, курсор, выделение в строке. ide=True — автоотступ после Enter и автоскобки, как в VS Code.
+    held — «физически зажатые» пользователем модификаторы: они добавляются к каждому нажатию."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self, ide: bool = False) -> None:
+        self.lines, self.r, self.c, self.sel, self.ide = [""], 0, 0, None, ide
+        self.held: set[int] = set()
+        self.bad: list[str] = []          # нажатия с зажатым Ctrl — так печать идти не должна
+        self.lock = threading.Lock()
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines)
+
+    def _del_sel(self) -> None:
+        if self.sel is not None and self.sel != self.c:
+            a, b = sorted((self.sel, self.c))
+            ln = self.lines[self.r]
+            self.lines[self.r], self.c = ln[:a] + ln[b:], a
+        self.sel = None
+
+    def char(self, ch: str) -> None:
+        with self.lock:
+            if W.VK_CONTROL in self.held:
+                self.bad.append(f"Ctrl+{ch!r}")
+            self._del_sel()
+            ln = self.lines[self.r]
+            closer = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}.get(ch, "") if self.ide else ""
+            self.lines[self.r] = ln[:self.c] + ch + closer + ln[self.c:]
+            self.c += 1
+
+    def tap(self, vk: int, *mods: int) -> None:
+        with self.lock:
+            mods = set(mods) | self.held
+            name, shift, ctrl = KEYS[vk], W.VK_SHIFT in mods, W.VK_CONTROL in mods
+            if W.VK_CONTROL in self.held:
+                self.bad.append(f"Ctrl+{name}")
+            if name in ("home", "end") and ctrl:
+                self.sel = None
+                self.r = 0 if name == "home" else len(self.lines) - 1
+                self.c = 0 if name == "home" else len(self.lines[self.r])
+            elif name in ("home", "end"):
+                self.sel = (self.c if self.sel is None else self.sel) if shift else None
+                self.c = 0 if name == "home" else len(self.lines[self.r])
+            elif name in ("up", "down"):
+                self.sel = None
+                self.r = max(0, self.r - 1) if name == "up" else min(len(self.lines) - 1, self.r + 1)
+                self.c = min(self.c, len(self.lines[self.r]))
+            elif name == "back":
+                if self.sel is not None and self.sel != self.c:
+                    self._del_sel()
+                elif self.c:
+                    ln = self.lines[self.r]
+                    self.lines[self.r] = ln[:self.c - 1] + ln[self.c:]
+                    self.c -= 1
+                elif self.r:
+                    prev = self.lines[self.r - 1]
+                    self.lines[self.r - 1:self.r + 1] = [prev + self.lines[self.r]]
+                    self.r, self.c = self.r - 1, len(prev)
+                self.sel = None
+            elif name == "enter":
+                self._del_sel()
+                ln = self.lines[self.r]
+                head = ln[:self.c]
+                indent = head[:len(head) - len(head.lstrip(" "))] if self.ide else ""
+                if self.ide and head.rstrip().endswith(":"):
+                    indent += "    "
+                self.lines[self.r:self.r + 1] = [head, indent + ln[self.c:]]
+                self.r, self.c = self.r + 1, len(indent)
+            elif name == "tab":
+                self._del_sel()
+                ln = self.lines[self.r]
+                self.lines[self.r] = ln[:self.c] + "    " + ln[self.c:]
+                self.c += 4
+
+
+ED = Editor()
+TARGET = 4242
+W.type_char = ED.char
+W.tap = ED.tap
+W.foreground_window = lambda: TARGET
+W.is_own_window = lambda h: False
+W.self_elevated = lambda: False
+W.window_elevated = lambda h: False
+W.window_process_name = lambda h: "code.exe"
+W.describe_window = lambda h: "code.exe «тест»"
+
+
+def _wait_mods(timeout: float = 5.0) -> bool:
+    end = time.monotonic() + timeout
+    while ED.held:
+        if time.monotonic() > end:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+W.wait_modifiers_released = _wait_mods
+DELAY = {"s": 0.0}
+TypingEngine._delay_after = lambda self, u: DELAY["s"]   # быстро: темп здесь не проверяется
+TypingEngine._gap = lambda self: 0.0005
+
+
+class FakeGuard(QObject):
+    tripped = Signal(str)
+    enter_pressed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.enabled, self.armed, self.watching = True, False, False
+
+    def set_hotkeys(self, _hk) -> None:
+        pass
+
+    def arm(self) -> None:
+        self.armed = self.enabled
+
+    def disarm(self) -> None:
+        self.armed = False
+
+    def watch_enter(self, on: bool) -> None:
+        self.watching = on
+
+    def shutdown(self) -> None:
+        self.armed = self.watching = False
+
+
+class FakeHotkeys(QObject):
+    triggered = Signal(str)
+    failed = Signal(str)
+
+    def set_bindings(self, _b) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        pass
+
+
+import autoprint.ui.main_window as M  # noqa: E402
+
+M.InputGuard, M.HotkeyManager = FakeGuard, FakeHotkeys
+from autoprint.ui.theme import theme  # noqa: E402
+
+
+def pump(seconds: float = 0.05) -> None:
+    end = time.time() + seconds
+    while time.time() < end:
+        app.processEvents()
+        time.sleep(0.002)
+
+
+def wait_for(pred, timeout: float = 10.0) -> bool:
+    end = time.time() + timeout
+    while time.time() < end:
+        app.processEvents()
+        if pred():
+            return True
+        time.sleep(0.002)
+    return False
+
+
+def make_window(profile: str):
+    s = Settings()
+    s.sound_enabled = False
+    s.update_auto_check = False
+    s.profile = profile
+    s.button_countdown_s = 0
+    s.minimize_on_button_start = False
+    s.hotkey_start_delay_ms = 0
+    store = TemplateStore()
+    win = M.MainWindow(s, store)
+    win.tray.showMessage = lambda *a, **k: None   # без всплывающих уведомлений Windows
+    win.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    win.show()
+    pump()
+    return win, s, store
+
+
+def press_enter(win) -> bool:
+    """Пользователь нажал Enter в редакторе: Enter дошёл до редактора, хук сообщил о нём программе."""
+    pos = win.engine._pos
+    ED.tap(W.VK_RETURN)
+    win.guard.enter_pressed.emit()
+    return wait_for(lambda: win.engine._pos > pos or win.engine.state == FINISHED, 5)
+
+
+def steps_lesson(profile: str, strip: bool) -> None:
+    ED.reset(ide=profile == PROFILE_IDE)
+    win, s, store = make_window(profile)
+    t = next(t for t in store.templates if t.title.startswith("Пример: пошаговый"))
+    win.open_template(t.id)
+    win.strip.sw_strip.setChecked(strip)
+    win._on_mode("steps")
+    pump()
+    b = t.code_blocks()[0]
+    ok, detail = True, ""
+    for k in S.step_numbers(b.steps, b.text.count("\n") + 1):
+        win.cmd_toggle()
+        if not wait_for(lambda: win.engine.state == FINISHED and win.job is None):
+            ok, detail = False, f"шаг {k}: не закончился ({win.engine.state})"
+            break
+        lines = S.analyze(b.text, b.steps, b.lang, strip)
+        exp = "\n".join(sl.typed for sl in lines if sl.typed is not None and sl.step <= k)
+        if ED.text != exp:
+            ok, detail = False, f"шаг {k}:\n  есть {ED.text!r}\n  ждём {exp!r}"
+            break
+    check(f"по шагам, {profile}, без комментариев={strip}: в редакторе ровно шаги 1…k", ok, detail)
+    check(f"по шагам, {profile}: после урока все шаги напечатаны, защита снята",
+          win._step_pointer(b.id) is None and not win.guard.armed and not win.guard.watching)
+    win.close()
+    pump()
+
+
+def lines_block(profile: str, strip: bool, hotkey_with_ctrl: bool) -> None:
+    ED.reset(ide=profile == PROFILE_IDE)
+    win, s, store = make_window(profile)
+    win.open_template(store.templates[0].id)
+    win.strip.sw_strip.setChecked(strip)
+    win._on_mode("lines")
+    pump()
+    job = win._job_for_armed()
+    win.cmd_toggle()
+    waits, watch_ok = 0, True
+    while wait_for(lambda: win.engine.state in (LINE_WAIT, FINISHED)) and win.engine.state == LINE_WAIT:
+        pump(0.01)
+        watch_ok &= win.guard.watching and not win.guard.armed
+        waits += 1
+        if hotkey_with_ctrl:
+            # Ctrl+F9: хоткей сработал, а Ctrl ещё зажат — печать должна дождаться отпускания
+            ED.held = {W.VK_CONTROL}
+            pos = win.engine._pos
+            win.cmd_toggle()
+            threading.Timer(0.15, ED.held.clear).start()
+            wait_for(lambda: win.engine._pos > pos or win.engine.state == FINISHED, 5)
+        elif not press_enter(win):
+            break
+    name = f"по строкам, {profile}, без комментариев={strip}, {'хоткей с Ctrl' if hotkey_with_ctrl else 'Enter'}"
+    check(f"{name}: напечатано всё ({waits} ожиданий)", ED.text == job["text"],
+          f"\n  есть {ED.text!r}\n  ждём {job['text']!r}" if ED.text != job["text"] else "")
+    check(f"{name}: в ожидании Enter только слушаем клавиатуру", watch_ok and waits > 0)
+    if hotkey_with_ctrl:
+        check(f"{name}: ни одного нажатия с зажатым Ctrl", not ED.bad, ED.bad[:4])
+    win.close()
+    pump()
+
+
+def races() -> None:
+    ED.reset()
+    win, s, store = make_window(PROFILE_PLAIN)
+    win.open_template(store.templates[0].id)
+    pump()
+    # запоздалый сигнал «Печатает» после «Стоп» не включает защиту
+    win._on_state(RUNNING)
+    check("запоздалое «Печатает» у стоящей печати не включает защиту", not win.guard.armed)
+    win.guard.armed = True
+    win._on_guard("key")
+    check("срабатывание защиты у стоящей печати её снимает", not win.guard.armed)
+
+    # «Стоп», пока движок ждёт отпускания Ctrl после хоткея (дольше, чем ждёт «Стоп»)
+    before = ED.text
+    ED.held = {W.VK_CONTROL}
+    win.cmd_toggle()
+    pump(0.1)
+    win.cmd_stop()
+    threading.Timer(1.4, ED.held.clear).start()
+    pump(2.0)
+    check("остановленный поток не возвращает «Печатает»/«Пауза»", win.engine.state == IDLE and not win.guard.armed,
+          win.engine.state)
+    check("остановленный поток ничего не печатает", ED.text == before, repr(ED.text[len(before):][:30]))
+
+    # смена режима в окне настроек во время печати — печать остановлена
+    DELAY["s"] = 0.02
+    win.cmd_toggle()
+    wait_for(lambda: win.engine.state == RUNNING)
+    s.print_mode = "lines"
+    win._on_setting_changed("print_mode")
+    pump()
+    check("режим сменили в настройках во время печати — печать остановлена", win.engine.state == IDLE,
+          win.engine.state)
+    s.print_mode = "block"
+    win._on_setting_changed("print_mode")
+
+    # блок, который печатается, удалили — печать остановлена
+    t = Template("удаление", [Block(BLOCK_CODE, "a = 1\nb = 2\nc = 3")])
+    store.insert(t)
+    win._fill_library(t.id)
+    v = win.open_template(t.id)
+    pump()
+    win.cmd_toggle()
+    wait_for(lambda: win.engine.state == RUNNING)
+    wb = v.code_widget(t.blocks[0].id)
+    t.blocks[0].text = ""   # пустой блок удаляется без вопроса
+    v._delete_block(wb)
+    pump(0.2)
+    check("удалили печатающийся блок — печать остановлена", win.engine.state == IDLE, win.engine.state)
+    DELAY["s"] = 0.0
+    win.close()
+    pump()
+
+
+def prompter_lines() -> None:
+    ED.reset()
+    win, s, store = make_window(PROFILE_PLAIN)
+    t = Template("суфлёр", [Block(BLOCK_CODE, "# в начале\nx = 1  # хвост x\n# между\ny = 2\n\n# перед z\n"
+                                              "z = 3  # хвост z")])
+    store.insert(t)
+    win._fill_library(t.id)
+    win.open_template(t.id)
+    win.strip.sw_strip.setChecked(True)
+    win._on_mode("lines")
+    pump(0.3)
+    said = [win.prompter.say.text()]
+    win.cmd_toggle()
+    while wait_for(lambda: win.engine.state in (LINE_WAIT, FINISHED)) and win.engine.state == LINE_WAIT:
+        pump(0.02)
+        said.append(win.prompter.say.text())
+        if not press_enter(win):
+            break
+    exp = ["в начале\nхвост x", "между", "перед z\nхвост z"]
+    check("суфлёр по строкам: комментарии между строками и хвостовые", said == exp, repr(said))
+    check("суфлёр по строкам: напечатан код без комментариев", ED.text == "x = 1\ny = 2\n\nz = 3", repr(ED.text))
+    win.close()
+    pump()
+
+
+def comments_speed() -> None:
+    rows = []
+    for i in range(500):
+        if i % 10 == 0:
+            rows.append(f"# Шаг {i // 10}: комментарий")
+        rows.append(f"    value_{i} = compute({i}, 'text', [1, 2, 3])  # хвост {i}")
+    text = "\n".join(rows)
+    t0 = time.perf_counter()
+    for _ in range(10):
+        spans = comment_spans(text, "python")
+    ms = (time.perf_counter() - t0) / 10 * 1000
+    check("разбор комментариев блока в 550 строк быстрый (печать в редакторе не тормозит)", ms < 15 and
+          len(spans) == 550, f"{ms:.1f} мс, комментариев {len(spans)}")
+
+
+def main() -> int:
+    theme.setup(app, "dark")
+    for profile in (PROFILE_PLAIN, PROFILE_IDE):
+        for strip in (False, True):
+            steps_lesson(profile, strip)
+    lines_block(PROFILE_IDE, False, hotkey_with_ctrl=False)
+    lines_block(PROFILE_PLAIN, True, hotkey_with_ctrl=False)
+    lines_block(PROFILE_IDE, True, hotkey_with_ctrl=True)
+    races()
+    prompter_lines()
+    comments_speed()
+    check("без исключений", not errors, errors[0].splitlines()[-1] if errors else "")
+    print("ГОТОВО" if not failed else f"ОШИБКИ: {failed}")
+    return 0 if not failed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

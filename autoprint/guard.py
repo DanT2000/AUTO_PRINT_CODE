@@ -6,6 +6,10 @@ WH_MOUSE_LL). Физическое нажатие клавиши или кноп
 Свои синтетические события (флаг INJECTED) пропускаются. Хуки снимаются сразу
 после паузы/остановки — вне печати приложение клавиатуру не слушает.
 Ничего не записывается: проверяется только факт нажатия.
+
+Режим «ждём Enter» (печать по строкам): ставится только хук клавиатуры, физический Enter без
+модификаторов сообщается сигналом enter_pressed и НЕ поглощается — он доходит до редактора и
+создаёт новую строку, после чего программа печатает следующую.
 """
 from __future__ import annotations
 
@@ -30,6 +34,9 @@ LLMHF_INJECTED = 0x01
 WM_QUIT = 0x0012
 WM_APP_ARM = 0x8000 + 10
 WM_APP_DISARM = 0x8000 + 11
+WM_APP_WATCH = 0x8000 + 12
+WM_APP_UNWATCH = 0x8000 + 13
+VK_RETURN = 0x0D
 
 # Модификаторы сами по себе паузу не вызывают: ими начинается хоткей (Ctrl+F9 и т.п.).
 _MODIFIERS = {0x10, 0x11, 0x12, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x14, 0x90, 0x91}
@@ -66,12 +73,14 @@ kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
 class InputGuard(QObject):
     tripped = Signal(str)   # "key" | "mouse"
+    enter_pressed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.enabled = True
         self._hotkeys: set[tuple[int, int]] = set()
         self._armed = False
+        self._watching = False
         self._fired = False
         self._kb = None
         self._ms = None
@@ -95,6 +104,10 @@ class InputGuard(QObject):
     def disarm(self) -> None:
         user32.PostThreadMessageW(self._thread_id, WM_APP_DISARM, 0, 0)
 
+    def watch_enter(self, on: bool) -> None:
+        """Печать по строкам: сообщать о физическом Enter (не поглощая его)."""
+        user32.PostThreadMessageW(self._thread_id, WM_APP_WATCH if on else WM_APP_UNWATCH, 0, 0)
+
     def shutdown(self) -> None:
         user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         self._thread.join(1)
@@ -107,28 +120,38 @@ class InputGuard(QObject):
         self._ready.set()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == WM_APP_ARM:
-                self._install()
+                self._armed = True
+                self._fired = False
             elif msg.message == WM_APP_DISARM:
-                self._uninstall()
-        self._uninstall()
+                self._armed = False
+            elif msg.message == WM_APP_WATCH:
+                self._watching = True
+            elif msg.message == WM_APP_UNWATCH:
+                self._watching = False
+            else:
+                continue
+            self._sync_hooks()
+        self._armed = self._watching = False
+        self._sync_hooks()
 
-    def _install(self) -> None:
-        self._fired = False
-        if self._kb:
-            return
+    def _sync_hooks(self) -> None:
+        """Хук клавиатуры — пока печатаем или ждём Enter; хук мыши — только пока печатаем."""
         hmod = kernel32.GetModuleHandleW(None)
-        self._kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_proc, hmod, 0)
-        self._ms = user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_proc, hmod, 0)
-        if not self._kb or not self._ms:
-            log.warning("Не удалось поставить хук ввода: ошибка %s", ctypes.get_last_error())
-        self._armed = True
-
-    def _uninstall(self) -> None:
-        self._armed = False
-        for h in (self._kb, self._ms):
-            if h:
-                user32.UnhookWindowsHookEx(h)
-        self._kb = self._ms = None
+        need_kb, need_ms = self._armed or self._watching, self._armed
+        if need_kb and not self._kb:
+            self._kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_proc, hmod, 0)
+            if not self._kb:
+                log.warning("Не удалось поставить хук клавиатуры: ошибка %s", ctypes.get_last_error())
+        elif not need_kb and self._kb:
+            user32.UnhookWindowsHookEx(self._kb)
+            self._kb = None
+        if need_ms and not self._ms:
+            self._ms = user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_proc, hmod, 0)
+            if not self._ms:
+                log.warning("Не удалось поставить хук мыши: ошибка %s", ctypes.get_last_error())
+        elif not need_ms and self._ms:
+            user32.UnhookWindowsHookEx(self._ms)
+            self._ms = None
 
     def _current_mods(self) -> int:
         mods = 0
@@ -139,14 +162,18 @@ class InputGuard(QObject):
 
     # Колбэки должны отрабатывать быстро (иначе Windows снимет хук), поэтому только флаги и emit.
     def _on_key(self, code, wparam, lparam):
-        if code == 0 and self._armed and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+        if code == 0 and wparam in (WM_KEYDOWN, WM_SYSKEYDOWN) and (self._armed or self._watching):
             k = ctypes.cast(lparam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            if not k.flags & LLKHF_INJECTED and k.vkCode not in _MODIFIERS \
-                    and (self._current_mods(), k.vkCode) not in self._hotkeys:
-                if not self._fired:
-                    self._fired = True
-                    self.tripped.emit("key")
-                return 1  # поглотить: случайная клавиша не должна попасть в код
+            injected = bool(k.flags & LLKHF_INJECTED)
+            if self._armed:
+                if not injected and k.vkCode not in _MODIFIERS \
+                        and (self._current_mods(), k.vkCode) not in self._hotkeys:
+                    if not self._fired:
+                        self._fired = True
+                        self.tripped.emit("key")
+                    return 1  # поглотить: случайная клавиша не должна попасть в код
+            elif not injected and k.vkCode == VK_RETURN and not self._current_mods():
+                self.enter_pressed.emit()   # не поглощаем: Enter должен дойти до редактора
         return user32.CallNextHookEx(None, code, wparam, lparam)
 
     def _on_mouse(self, code, wparam, lparam):

@@ -42,3 +42,7 @@ tests/pages/package-lock.json
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# --- Сборка exe: спецификация PyInstaller от ручного запуска, вывод Inno Setup по умолчанию ---
+/*.spec
+installer/Output/

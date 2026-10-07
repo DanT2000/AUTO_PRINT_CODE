@@ -59,7 +59,8 @@ class Settings:
     hotkey_stop: str = "Ctrl+F11"      # остановить
     hotkey_next_block: str = "Ctrl+F12"        # следующий блок кода
     hotkey_prev_block: str = "Ctrl+Shift+F12"  # предыдущий блок кода
-    hotkey_next_tab: str = ""                  # следующая вкладка-образец
+    hotkey_next_tab: str = ""                  # следующий образец
+    hotkey_step_back: str = ""                 # шаг назад без печати (режим «По шагам»)
 
     cpm: int = 320                     # скорость, символов в минуту
     jitter: int = 35                   # разброс задержки, %
@@ -72,15 +73,19 @@ class Settings:
     selection_whole_lines: bool = True # выделение в образце расширяется до целых строк
     strip_comments: bool = False       # не печатать комментарии из кода
     human_typing: bool = False         # имитация ручного ввода: живой ритм, обдумывание, опечатки
-    typo_per_100_words: int = 3        # опечаток на 100 слов (исправляются Backspace)
+    typo_per_100_words: int = 3        # устарело (до 0.5): опечатки на 100 слов — см. typos_per_100
+    typos_per_100: float = 1.5         # опечаток на 100 символов текста (исправляются Backspace)
     think_pause_s: float = 1.5         # пауза на обдумывание перед новой строкой (до …, с)
+
+    print_mode: str = "block"          # block — блок целиком | lines — по строкам | steps — по шагам
+    show_prompter: bool = True         # суфлёр: что дальше и что сказать (комментарии шага)
 
     profile: str = PROFILE_IDE
     esc_before_enter: bool = False     # закрывать подсказки Esc перед Enter (не для Jupyter!)
 
     sound_enabled: bool = True
     sound_volume: int = 35             # 0..100
-    sound_style: str = "office"        # office | brown | red | cream | blue (см. sounds.STYLES)
+    sound_style: str = "office"        # office | brown | red | cream | blue (sounds.STYLES) | my_<…> — свой звук
 
     hotkey_start_delay_ms: int = 150   # пауза перед стартом по хоткею
     button_countdown_s: int = 3        # отсчёт при старте кнопкой в окне
@@ -89,6 +94,12 @@ class Settings:
     guard_enabled: bool = True         # пауза при нажатии клавиши / клике во время печати
     auto_advance: bool = False         # по окончании выбрать следующий блок кода
     always_on_top: bool = False
+    theme: str = "system"              # system — как в Windows | dark | light
+
+    close_to_tray: bool = False        # «закрыть» прячет окно в трей, выход — из меню
+    pin_tray_icon: bool = False        # значок всегда виден у часов (не в «скрытых значках»)
+    autostart: bool = False            # запускать вместе с Windows (сразу в трей)
+    samples_seen: list = field(default_factory=list)   # какие примеры уже добавлялись в базу
 
     update_auto_check: bool = True     # проверять обновления на GitHub сам
     update_interval_h: int = 24        # как часто: 0 — при каждом запуске, 24 — раз в день, 168 — раз в неделю
@@ -144,6 +155,7 @@ class Block:
     role: str = "text"   # для Markdown-блока: text | task | explain | hint (см. ROLES)
     title: str = ""      # свой заголовок блока; пусто → название по типу
     zoom: int = 100      # масштаб содержимого блока, % (Ctrl/Shift + колёсико)
+    steps: list[int] = field(default_factory=list)   # шаг каждой строки кода (режим «По шагам»); пусто — все 1
 
     def display_title(self, code_number: int = 0) -> str:
         if self.title.strip():
@@ -185,8 +197,54 @@ def sample_template() -> Template:
                             for b in (Block(BLOCK_MARKDOWN, md, role="task"), Block(BLOCK_CODE, code))])
 
 
+# Пример печати по шагам: шаг 3 возвращается наверх (import), шаг 4 — вставка в середину.
+# Комментарии — текст для суфлёра: с «Без комментариев» они не печатаются, а читаются вслух.
+STEPS_SAMPLE_ID = "steps_v1"
+STEPS_SAMPLE_INTRO = """## Пошаговый урок: оценки учеников
+
+Так записывают урок, где код растёт частями и иногда приходится вернуться наверх.
+
+1. На пульте: режим **«По шагам»** и **«Без комментариев»**.
+2. Откройте пустой файл в VS Code (или новую ячейку Jupyter) и поставьте туда курсор.
+3. Над лентой — **суфлёр**: что сказать перед шагом (это комментарии шага — они не печатаются).
+   Сказали — нажали **Ctrl+F9**: программа напечатает шаг сама.
+4. Шаг 3 вернётся наверх и допишет `import`, шаг 4 вставит строку в середину.
+
+Шаг строки — цветной номер слева от номера строки: правый щелчок по строке, **Alt+1…9**
+или кнопка «Шаги» в шапке блока (там же — разметка по комментариям одним щелчком)."""
+STEPS_SAMPLE_CODE = '''import statistics
+
+# Оценки учеников
+grades = [5, 4, 3, 5, 4]
+grades.append(5)  # пришла ещё одна оценка — вернулись наверх и дописали
+print("Оценки:", grades)
+
+# Средний балл
+average = sum(grades) / len(grades)
+print("Средний:", round(average, 2))
+
+# Медиана — возьмём готовую функцию из модуля statistics
+median = statistics.median(grades)
+print("Медиана:", median)'''
+STEPS_SAMPLE_STEPS = [3, 3, 1, 1, 4, 1, 2, 2, 2, 2, 3, 3, 3, 3]
+
+
+def steps_sample_template() -> Template:
+    return Template(title="Пример: пошаговый урок",
+                    blocks=[Block(BLOCK_MARKDOWN, STEPS_SAMPLE_INTRO, role="explain"),
+                            Block(BLOCK_CODE, STEPS_SAMPLE_CODE, steps=list(STEPS_SAMPLE_STEPS))])
+
+
 def _block_from(d: dict) -> Block:
-    return Block(**{k: v for k, v in d.items() if k in Block.__dataclass_fields__})
+    b = Block(**{k: v for k, v in d.items() if k in Block.__dataclass_fields__})
+    # образец могли поправить руками или прислать из другой программы: переводы строк Windows (редактор
+    # их убирает, а печать по строкам и по шагам набрала бы «\r») и шаги не числами
+    b.text = str(b.text).replace("\r\n", "\n").replace("\r", "\n")
+    try:
+        b.steps = [max(1, int(s)) for s in b.steps] if isinstance(b.steps, list) else []
+    except (TypeError, ValueError):
+        b.steps = []
+    return b
 
 
 def _flatten_tasks(tasks: list[dict]) -> list[Block]:

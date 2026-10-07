@@ -1,0 +1,3 @@
+# Сборка AutoPrintCode.exe: build_exe.bat (tools\build_exe.py)
+-r requirements.txt
+pyinstaller==6.22.3

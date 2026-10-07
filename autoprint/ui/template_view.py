@@ -1,11 +1,12 @@
-"""Вкладка образца: все блоки образца одной лентой."""
+"""Образец: заголовок и все блоки одной лентой."""
 from __future__ import annotations
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer, Signal
-from PySide6.QtWidgets import QHBoxLayout, QMessageBox, QPushButton, QScrollArea, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QMessageBox, QScrollArea, QVBoxLayout, QWidget
 
 from ..storage import BLOCK_CODE, BLOCK_MARKDOWN, Block, Template
 from .blocks import BlockWidget, CodeBlockWidget, MarkdownBlockWidget, make_block_widget
+from .widgets import button
 
 
 class ZoomWheelFilter(QObject):
@@ -35,37 +36,78 @@ class ZoomWheelFilter(QObject):
         return True
 
 
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    n10, n100 = n % 10, n % 100
+    if n10 == 1 and n100 != 11:
+        return one
+    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
+        return few
+    return many
+
+
 class TemplateView(QWidget):
     changed = Signal()            # содержимое образца изменилось → сохранить
     armed_changed = Signal(str)   # id активного блока кода
     zoom_changed = Signal(int)    # масштаб какого-то блока изменился, %
+    steps_changed = Signal(str)   # разметка шагов блока (id) поменялась
+    step_pointer_requested = Signal(str, int)   # (id блока, шаг) — печатать дальше с этого шага
 
     def __init__(self, template: Template) -> None:
         super().__init__()
         self.template = template
         self.widgets: list[BlockWidget] = []
+        self.step_mode = False
+        self.step_pointer = lambda _bid: None   # главное окно подставляет: id блока → следующий шаг
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.page = QWidget()
+        self.page.setObjectName("page")
         self.page_lay = QVBoxLayout(self.page)
+        self.page_lay.setContentsMargins(2, 6, 12, 28)
         self.page_lay.setSpacing(10)
+
+        head = QWidget()
+        hl = QVBoxLayout(head)
+        hl.setContentsMargins(0, 0, 0, 6)
+        hl.setSpacing(2)
+        self.title_lbl = QLabel()
+        self.title_lbl.setObjectName("pageTitle")
+        self.lede = QLabel()
+        self.lede.setObjectName("lede")
+        hl.addWidget(self.title_lbl)
+        hl.addWidget(self.lede)
+        self.page_lay.addWidget(head)
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(10)
+        b_md = button("Текст (Markdown)", "plus")
+        b_md.setObjectName("addBtn")
+        b_md.clicked.connect(lambda: self.add_block(BLOCK_MARKDOWN))
+        b_code = button("Блок кода", "plus")
+        b_code.setObjectName("addBtn")
+        b_code.clicked.connect(lambda: self.add_block(BLOCK_CODE))
+        add_row.addWidget(b_md, 1)
+        add_row.addWidget(b_code, 1)
+        self.page_lay.addLayout(add_row)
         self.page_lay.addStretch(1)
         self.scroll.setWidget(self.page)
         lay.addWidget(self.scroll, 1)
-        add_row = QHBoxLayout()
-        b_md = QPushButton("＋ Текст (Markdown)")
-        b_md.clicked.connect(lambda: self.add_block(BLOCK_MARKDOWN))
-        b_code = QPushButton("＋ Блок кода")
-        b_code.clicked.connect(lambda: self.add_block(BLOCK_CODE))
-        add_row.addWidget(b_md)
-        add_row.addWidget(b_code)
-        add_row.addStretch(1)
-        lay.addLayout(add_row)
 
+        self.changed.connect(self.refresh_header)
         self._rebuild()
+
+    # ------------------------------------------------------------ заголовок
+    def refresh_header(self) -> None:
+        t = self.template
+        self.title_lbl.setText(t.title)
+        n, code = len(t.blocks), len(t.code_blocks())
+        self.lede.setText(f"{n} {_plural(n, 'блок', 'блока', 'блоков')} · "
+                          f"кода — {code} · двойной щелчок по названию слева — переименовать")
 
     # ------------------------------------------------------------ блоки
     def _rebuild(self, keep_scroll: bool = False) -> None:
@@ -82,13 +124,14 @@ class TemplateView(QWidget):
             if b.zoom != 100:
                 wdg.set_zoom(b.zoom)
             self._wire(wdg)
-            self.page_lay.insertWidget(self.page_lay.count() - 1, wdg)
+            self.page_lay.insertWidget(1 + len(self.widgets), wdg)
             self.widgets.append(wdg)
         # если в образце ещё нет активного блока — делаем активным первый блок кода
         codes = [w for w in self.widgets if isinstance(w, CodeBlockWidget)]
         if codes and not any(w.block.id == self.template.active_block for w in codes):
             self.arm(codes[0].block.id)
         self._apply_armed()
+        self.refresh_header()
         if keep_scroll:
             QTimer.singleShot(0, lambda: self.scroll.verticalScrollBar().setValue(scroll_pos))
         else:
@@ -107,6 +150,9 @@ class TemplateView(QWidget):
         wdg.zoom_changed.connect(self.zoom_changed)
         if isinstance(wdg, CodeBlockWidget):
             wdg.arm_requested.connect(lambda w: self.arm(w.block.id))
+            wdg.steps_changed.connect(lambda w: self.steps_changed.emit(w.block.id))
+            wdg.step_pointer_requested.connect(lambda w, k: self.step_pointer_requested.emit(w.block.id, k))
+            wdg.set_step_mode(self.step_mode, self.step_pointer(wdg.block.id))
 
     def _renumber(self) -> None:
         n = 0
@@ -122,7 +168,7 @@ class TemplateView(QWidget):
         self._insert_block(bl.index(active) + 1 if active else len(bl), kind)
 
     def _insert_near(self, wdg: BlockWidget, after: int, kind: str) -> None:
-        """Кнопки «＋↑» / «＋↓» в шапке блока."""
+        """Кнопки «вставить выше / ниже» в шапке блока."""
         self._insert_block(self.template.blocks.index(wdg.block) + after, kind)
 
     def _insert_block(self, idx: int, kind: str) -> None:
@@ -154,7 +200,7 @@ class TemplateView(QWidget):
         bl[i], bl[j] = bl[j], bl[i]
         self.widgets[i], self.widgets[j] = self.widgets[j], self.widgets[i]
         self.page_lay.removeWidget(wdg)
-        self.page_lay.insertWidget(j, wdg)
+        self.page_lay.insertWidget(1 + j, wdg)
         self._renumber()
         QTimer.singleShot(30, wdg, lambda: self.scroll.ensureWidgetVisible(wdg, 0, 40))
         self.changed.emit()
@@ -208,6 +254,18 @@ class TemplateView(QWidget):
 
     def code_widget(self, block_id: str) -> CodeBlockWidget | None:
         return next((w for w in self.widgets if isinstance(w, CodeBlockWidget) and w.block.id == block_id), None)
+
+    def clear_progress(self) -> None:
+        for w in self.widgets:
+            if isinstance(w, CodeBlockWidget):
+                w.clear_progress()
+
+    def apply_step_mode(self, on: bool) -> None:
+        """Режим «По шагам» и указатели «следующий шаг» — во все блоки кода."""
+        self.step_mode = on
+        for w in self.widgets:
+            if isinstance(w, CodeBlockWidget):
+                w.set_step_mode(on, self.step_pointer(w.block.id))
 
     def go_to_block(self, block_id: str) -> None:
         if not self.template.find_block(block_id):
