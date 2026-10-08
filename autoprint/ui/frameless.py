@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+from pathlib import Path
 from ctypes import wintypes
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, Signal
@@ -117,18 +118,44 @@ def style_native_frame(hwnd: int) -> None:
     _dwm_set(hwnd, DWMWA_BORDER_COLOR, _colorref(theme.c("panel")))
 
 
+_strays_logged: set[str] = set()
+
+
+def is_stray_window(w: QWidget) -> bool:
+    """Обычный виджет, показанный самостоятельным окном. Так бывает, если setVisible(True)/show() вызвать
+    до вставки виджета в окно программы: Windows успевает показать его отдельным окном с кнопкой на
+    панели задач («мелькают окна AutoPrintCode / Python»). Окна программы, диалоги, меню и подсказки — не в счёт."""
+    from PySide6.QtWidgets import QDialog
+    return w.isWindow() and w.windowType() == Qt.WindowType.Window and not isinstance(w, (FramelessWindow, QDialog))
+
+
+def _log_stray(w: QWidget) -> None:
+    """Лишнее окно — в журнал (раз на место в коде): так оно попадёт и в отчёт об ошибке."""
+    import traceback
+    frames = [f for f in traceback.extract_stack()[:-2] if "autoprint" in f.filename.replace("\\", "/")]
+    where = " ← ".join(f"{Path(f.filename).name}:{f.lineno}" for f in reversed(frames[-4:])) or "?"
+    key = f"{type(w).__name__}|{w.objectName()}|{where}"
+    if key not in _strays_logged:
+        _strays_logged.add(key)
+        log.warning("Лишнее окно: %s «%s» показано до вставки в окно программы (%s)",
+                    type(w).__name__, w.objectName(), where)
+
+
 class NativeFrameStyler(QObject):
-    """Ставится на приложение: красит системные рамки диалогов при показе и при смене темы."""
+    """Ставится на приложение: красит системные рамки диалогов при показе и при смене темы.
+    Заодно сторожит «лишние окна» (is_stray_window) — пишет в журнал, откуда такое окно показали."""
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         theme.changed.connect(self._restyle_all)
 
     def eventFilter(self, obj, ev) -> bool:
-        if ev.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow() \
-                and not isinstance(obj, FramelessWindow) \
-                and obj.windowType() in (Qt.WindowType.Dialog, Qt.WindowType.Window):
-            style_native_frame(int(obj.winId()))
+        if ev.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow():
+            if not isinstance(obj, FramelessWindow) \
+                    and obj.windowType() in (Qt.WindowType.Dialog, Qt.WindowType.Window):
+                style_native_frame(int(obj.winId()))
+            if is_stray_window(obj):
+                _log_stray(obj)
         return False
 
     def _restyle_all(self) -> None:

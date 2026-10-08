@@ -15,11 +15,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["AUTOPRINT_DATA"] = tempfile.mkdtemp(prefix="autoprint-regress-")
+import quiet  # noqa: E402,F401 — окна только в памяти, без трея и уведомлений
 
 from PySide6.QtCore import QEvent, QObject, Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 
 app = QApplication(sys.argv)
+quiet.patch()
 errors: list[str] = []
 
 

@@ -3,7 +3,7 @@
 
     python tests/ui_smoke.py <папка для снимков>
 
-Окна не появляются на экране (WA_DontShowOnScreen). Рабочая папка data/ не используется.
+Тихий режим (tests/quiet.py): окна рисуются в памяти, без трея и уведомлений. Рабочая папка data/ не используется.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["AUTOPRINT_DATA"] = tempfile.mkdtemp(prefix="autoprint-ui-")
+import quiet  # noqa: E402,F401 — окна только в памяти, без трея и уведомлений
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
@@ -36,6 +37,7 @@ def shot(w, name: str) -> None:
 
 def main() -> int:
     app = QApplication(sys.argv)
+    quiet.patch()
     from autoprint.storage import Settings, TemplateStore
     from autoprint.typer import RUNNING
     from autoprint.ui.main_window import MainWindow

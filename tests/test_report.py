@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 TMP = Path(tempfile.mkdtemp(prefix="autoprint-report-"))
 os.environ["AUTOPRINT_DATA"] = str(TMP / "data")
-SHOTS = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.mkdtemp(prefix="autoprint-report-shots-"))
+import quiet  # noqa: E402,F401 — окна только в памяти, без трея и уведомлений
+SHOTS =Path(sys.argv[1]) if len(sys.argv) > 1 else Path(tempfile.mkdtemp(prefix="autoprint-report-shots-"))
 
 from autoprint import __version__, report, updater  # noqa: E402
 from autoprint.logs import LOG_DIR, LOG_FILE  # noqa: E402
@@ -229,6 +230,7 @@ def test_with_app() -> None:
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import QApplication, QLabel
     app = QApplication(sys.argv)
+    quiet.patch()
     rep = report.collect("с окном")
     gui = rep["system"].get("gui")
     check("с QApplication — экраны и масштаб", gui and gui["screens"] and gui["screens"][0]["scale"] > 0, str(gui))

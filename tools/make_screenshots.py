@@ -16,14 +16,34 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["AUTOPRINT_DATA"] = tempfile.mkdtemp(prefix="autoprint-shots-")
 os.environ["QT_SCALE_FACTOR"] = "1.5"
+# настоящая отрисовка Windows (шрифты как в программе), но окна не выводятся на экран (WA_DontShowOnScreen),
+# а значок в трее, уведомления и глобальные хоткеи отключает tests/quiet.py
+os.environ["QT_QPA_PLATFORM"] = "windows"
 
-from PySide6.QtCore import QRect, Qt  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, QRect, Qt  # noqa: E402
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QWidget  # noqa: E402
 
-OUT = ROOT / "docs" / "images"
+OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "docs" / "images"
 OUT.mkdir(parents=True, exist_ok=True)
 app = QApplication(sys.argv)
+sys.path.insert(0, str(ROOT / "tests"))
+import quiet  # noqa: E402 — без значка в трее, уведомлений и глобальных хоткеев
+
+quiet.patch()
+
+
+class _OffScreen(QObject):
+    """Каждому окну — WA_DontShowOnScreen ещё до первого показа: снимок делается, на экране ничего нет."""
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() == QEvent.Type.Polish and isinstance(obj, QWidget) and obj.isWindow():
+            obj.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        return False
+
+
+_offscreen = _OffScreen()
+app.installEventFilter(_offscreen)
 
 
 def settle(n: int = 8) -> None:
@@ -41,7 +61,7 @@ def shot(w, name: str) -> None:
     settle()
     path = OUT / f"{name}.png"
     w.grab().save(str(path), "PNG", 9)
-    print(f"{path.relative_to(ROOT)}  {path.stat().st_size // 1024} КБ")
+    print(f"{path.name}  {path.stat().st_size // 1024} КБ")
 
 
 def scroll_to(win, block_id: str) -> None:
