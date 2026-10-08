@@ -16,8 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ["AUTOPRINT_DATA"] = tempfile.mkdtemp(prefix="autoprint-regress-")
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtCore import QEvent, QObject, Qt  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMenu, QWidget  # noqa: E402
 
 app = QApplication(sys.argv)
 errors: list[str] = []
@@ -52,10 +52,28 @@ def pump(seconds: float = 0.2) -> None:
         time.sleep(0.01)
 
 
+class StraySpy(QObject):
+    """Виджет, показанный самостоятельным окном (setVisible(True)/show() до вставки в родителя), мелькает
+    на панели задач. Ждём только настоящие окна программы, меню и подсказки."""
+    EXPECTED = ("MainWindow", "SettingsWindow", "ReportDialog", "QMenu", "QTipLabel", "QComboBoxPrivateContainer")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stray: list[str] = []
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() == QEvent.Type.Show and isinstance(obj, QWidget) and obj.isWindow() \
+                and type(obj).__name__ not in self.EXPECTED and not isinstance(obj, QMenu):
+            self.stray.append(f"{type(obj).__name__} «{obj.objectName()}»")
+        return False
+
+
 def main() -> int:
     s = Settings()
     s.sound_enabled = False
     theme.setup(app, "dark")
+    spy = StraySpy()
+    app.installEventFilter(spy)
     store = TemplateStore()
     # блок с ролью, которой нет в программе (такое приходит из чужих .ipynb / .json)
     store.templates[0].blocks.insert(0, Block(BLOCK_MARKDOWN, "чужая роль", role="warning"))
@@ -105,6 +123,17 @@ def main() -> int:
     check("настройки — окно-владелец главного", win.settings_win.parentWidget() is win)
     win.settings_win.close()
     pump()
+
+    # окно «Сообщить об ошибке» — тоже из строк-карточек
+    from autoprint.ui.report_dialog import ReportDialog
+    d = ReportDialog(win, s)
+    d.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    d.show()
+    pump()
+    d.close()
+    pump()
+    check("настройки и отчёт открываются без лишних окон на панели задач", not spy.stray,
+          f"{len(spy.stray)}: {', '.join(sorted(set(spy.stray)))[:200]}")
 
     # пауза во время отсчёта: старт отменяется и не превращается в «Печатает»
     # (останов через 1,5 с — раньше, чем кончится отсчёт, поэтому печати не будет в любом случае)

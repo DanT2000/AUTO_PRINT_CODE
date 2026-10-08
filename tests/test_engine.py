@@ -550,6 +550,24 @@ def mouse_click_pauses() -> None:
     check("клик на паузе не мешает продолжить", resumed == RUNNING and hits == ["mouse"], f"{resumed} {hits}")
 
 
+def tour_sample() -> None:
+    """«Пример занятия: все возможности»: в новой базе — один и открыт первым; у обновившихся (база есть,
+    а пример ещё не показывали) — добавляется наверх и открывается."""
+    from autoprint.samples import TOUR_TITLE
+    ED.reset()
+    win, s, store = make_window(PROFILE_PLAIN)
+    titles = [t.title for t in store.templates]
+    check("новая база: экскурсия одна и открыта", titles.count(TOUR_TITLE) == 1 and
+          win.current_view().template.title == TOUR_TITLE, repr(titles))
+    win.close()
+    pump()
+    win, s, store = make_window(PROFILE_PLAIN)   # тот же templates.json, но в настройках пример ещё не видели
+    check("после обновления: экскурсия добавлена наверх и открыта", store.templates[0].title == TOUR_TITLE and
+          win.current_view().template is store.templates[0] and "tour_v1" in s.samples_seen)
+    win.close()
+    pump()
+
+
 def tray_click_keeps_pause() -> None:
     """«Старт / пауза» из меню трея во время печати: щелчок по значку (окно Проводника) уже поставил паузу
     «кликом мышью» — пункт меню её оставляет, а не продолжает печать."""
@@ -577,6 +595,7 @@ def tray_click_keeps_pause() -> None:
 
 def main() -> int:
     theme.setup(app, "dark")
+    tour_sample()   # первым: проверяет новую базу
     smooth_newlines()
     mouse_click_pauses()
     tray_click_keeps_pause()

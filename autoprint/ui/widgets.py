@@ -390,7 +390,10 @@ class Row(QWidget):
         self.title = label(title, "rowTitle")
         text.addWidget(self.title)
         self.sub = label(sub, "rowSub", wrap=True)
-        self.sub.setVisible(bool(sub))
+        if not sub:
+            # только скрывать: setVisible(True) у ещё не вставленной подписи показал бы её отдельным окном —
+            # при открытии настроек на панели задач мелькали десятки окон «AutoPrintCode»
+            self.sub.hide()
         text.addWidget(self.sub)
         self.controls = QHBoxLayout()
         self.controls.setSpacing(8)

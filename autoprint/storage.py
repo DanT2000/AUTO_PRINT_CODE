@@ -184,20 +184,10 @@ class Template:
         return [b for b in self.blocks if b.type == BLOCK_CODE]
 
 
-SAMPLE_TASKS = [
-    ("## Задача 1. Сумма чисел\n\nНапишите функцию `total(nums)`, которая возвращает сумму "
-     "чисел списка.\n\n- без встроенной `sum()`\n- пустой список → `0`",
-     "def total(nums):\n    result = 0\n    for n in nums:\n        result += n\n    return result\n"
-     "\n\nprint(total([1, 2, 3]))  # 6\nprint(\"Готово!\")"),
-    ("## Задача 2. Чётные числа\n\nВыведите все чётные числа от 0 до 10.",
-     "for i in range(0, 11, 2):\n    print(i)"),
-]
-
-
 def sample_template() -> Template:
-    return Template(title="Пример занятия",
-                    blocks=[b for md, code in SAMPLE_TASKS
-                            for b in (Block(BLOCK_MARKDOWN, md, role="task"), Block(BLOCK_CODE, code))])
+    """Образец для новой базы — экскурсия по всем возможностям (autoprint/samples.py)."""
+    from .samples import tour_template
+    return tour_template()
 
 
 # Пример печати по шагам: шаг 3 возвращается наверх (import), шаг 4 — вставка в середину.
@@ -282,6 +272,7 @@ def _fresh_ids(t: Template) -> Template:
 class TemplateStore:
     def __init__(self) -> None:
         self.templates: list[Template] = []
+        self.created_fresh = False   # базы не было — создана с образцом-экскурсией (второй раз его не добавлять)
         self.load()
 
     def load(self) -> None:
@@ -289,6 +280,7 @@ class TemplateStore:
             raw = json.loads(TEMPLATES_FILE.read_text(encoding="utf-8"))
         except FileNotFoundError:
             self.templates = [sample_template()]
+            self.created_fresh = True
             self.save()
             return
         except (OSError, ValueError) as e:

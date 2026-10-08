@@ -231,6 +231,7 @@ class MainWindow(FramelessWindow):
         m.addAction(icons.icon("export"), "Экспорт образца в .ipynb…", lambda: self.export_current("ipynb"))
         m.addAction(icons.icon("export"), "Экспорт образца в .json…", lambda: self.export_current("json"))
         m.addSeparator()
+        m.addAction(icons.icon("file-code"), "Добавить пример занятия (все возможности)", self._add_tour_sample)
         m.addAction(icons.icon("file-code"), "Добавить пример пошагового урока", self._add_steps_sample)
         m.addAction(icons.icon("lines"), "Все блоки — обычный размер\tCtrl+Shift+0", self._reset_zoom)
         m.addAction(icons.icon("bug"), "Сообщить об ошибке…", self.open_report)
@@ -737,14 +738,36 @@ class MainWindow(FramelessWindow):
         except OSError as e:
             self._notify(f"Не удалось сохранить образцы: {e}", warn=True)
 
-    def _ensure_samples(self) -> None:
-        """Пример пошагового урока — один раз (и новым пользователям, и после обновления)."""
+    def _ensure_samples(self) -> str:
+        """Встроенные примеры — по одному разу (и новым пользователям, и после обновления): пошаговый урок
+        и «Пример занятия: все возможности». Возвращает id экскурсии, если её добавили только что
+        (у обновившихся — её и открыть), иначе пустую строку."""
+        from ..samples import TOUR_SAMPLE_ID, tour_template
         from ..storage import STEPS_SAMPLE_ID
-        if STEPS_SAMPLE_ID not in self.settings.samples_seen:
+        seen, changed, tour_id = self.settings.samples_seen, False, ""
+        if STEPS_SAMPLE_ID not in seen:
             self.store.insert(steps_sample_template())
-            self.settings.samples_seen.append(STEPS_SAMPLE_ID)
+            seen.append(STEPS_SAMPLE_ID)
+            changed = True
+        if TOUR_SAMPLE_ID not in seen:
+            if not self.store.created_fresh:   # в новой базе экскурсия уже есть — она первая
+                t = tour_template()
+                self.store.templates.insert(0, t)
+                tour_id = t.id
+            seen.append(TOUR_SAMPLE_ID)
+            changed = True
+        if changed:
             self._save_store()
             self._save_settings()
+        return tour_id
+
+    def _add_tour_sample(self) -> None:
+        from ..samples import tour_template
+        t = tour_template()
+        self.store.templates.insert(0, t)
+        self._touch()
+        self._fill_library(t.id)
+        self.open_template(t.id)
 
     def _add_steps_sample(self) -> None:
         t = self.store.insert(steps_sample_template())
@@ -754,12 +777,12 @@ class MainWindow(FramelessWindow):
 
     def _restore_session(self) -> None:
         s = self.settings
-        self._ensure_samples()
+        tour_id = self._ensure_samples()
         if s.window_geometry:
             self.restoreGeometry(QByteArray.fromBase64(s.window_geometry.encode()))
-        self._fill_library(s.current_tab)
-        tid = s.current_tab if self.store.get(s.current_tab) else \
-            (self.store.templates[0].id if self.store.templates else "")
+        tid = tour_id or (s.current_tab if self.store.get(s.current_tab) else
+                          (self.store.templates[0].id if self.store.templates else ""))
+        self._fill_library(tid)
         if tid:
             self.open_template(tid)
         self._update_armed_label()
