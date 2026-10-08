@@ -79,6 +79,8 @@ class Settings:
 
     print_mode: str = "block"          # block — блок целиком | lines — по строкам | steps — по шагам
     show_prompter: bool = True         # суфлёр: что дальше и что сказать (комментарии шага)
+    step_nav: str = "arrows"           # шаги: arrows — стрелками от курсора (код — продолжение файла)
+                                       #       | home — от начала документа (Ctrl+Home)
 
     profile: str = PROFILE_IDE
     esc_before_enter: bool = False     # закрывать подсказки Esc перед Enter (не для Jupyter!)
@@ -95,6 +97,7 @@ class Settings:
     auto_advance: bool = False         # по окончании выбрать следующий блок кода
     always_on_top: bool = False
     theme: str = "system"              # system — как в Windows | dark | light
+    ui_scale: int = 100                # размер интерфейса, % (100 / 125 / 150 / 175) — после перезапуска
 
     close_to_tray: bool = False        # «закрыть» прячет окно в трей, выход — из меню
     pin_tray_icon: bool = False        # значок всегда виден у часов (не в «скрытых значках»)

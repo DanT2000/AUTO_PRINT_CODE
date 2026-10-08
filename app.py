@@ -1,6 +1,8 @@
 """AutoPrintCode — запуск: python app.py"""
 from __future__ import annotations
 
+import logging
+import os
 import signal
 import sys
 import threading
@@ -20,6 +22,15 @@ def main() -> int:
     from autoprint import taskbar
     # своя иконка на панели задач, а не иконка python.exe
     taskbar.set_process_app_id()
+
+    # размер интерфейса (⚙ → Вид): масштаб Qt задаётся до создания приложения — поэтому после перезапуска
+    # Переменную, выставленную нами же, перезапущенная программа наследует — её заменяем; чужую не трогаем
+    if "QT_SCALE_FACTOR" not in os.environ or os.environ.get("AUTOPRINT_QT_SCALE") == os.environ["QT_SCALE_FACTOR"]:
+        os.environ.pop("QT_SCALE_FACTOR", None)
+        os.environ.pop("AUTOPRINT_QT_SCALE", None)
+        scale = Settings.load().ui_scale
+        if scale != 100 and 50 <= scale <= 300:
+            os.environ["QT_SCALE_FACTOR"] = os.environ["AUTOPRINT_QT_SCALE"] = f"{scale / 100:g}"
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
@@ -49,11 +60,30 @@ def main() -> int:
         return 0
 
     from autoprint.logs import setup_logging
+    crash_box_open = False
+
     def on_crash(text: str) -> None:
-        # окно можно показать только из GUI-потока; ошибки фоновых потоков остаются в журнале
-        if threading.current_thread() is threading.main_thread():
-            QMessageBox.critical(None, APP_NAME, f"Внутренняя ошибка: {text}\n\n"
-                                                 "Подробности — в журнале (меню логотипа → Журнал работы).")
+        nonlocal crash_box_open
+        # окно можно показать только из GUI-потока; ошибки фоновых потоков остаются в журнале.
+        # Одна и та же ошибка может повторяться — второе окно поверх первого не показываем
+        if threading.current_thread() is not threading.main_thread() or crash_box_open:
+            return
+        crash_box_open = True
+        try:
+            box = QMessageBox(QMessageBox.Icon.Critical, APP_NAME,
+                              f"Внутренняя ошибка: {text}\n\nПодробности — в журнале. Сообщите об ошибке — "
+                              "отчёт без личных данных поможет её исправить.", parent=QApplication.activeWindow())
+            report_btn = box.addButton("Сообщить об ошибке…", QMessageBox.ButtonRole.ActionRole)
+            box.addButton("Закрыть", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is report_btn:
+                try:
+                    from autoprint.ui.report_dialog import show_report_dialog
+                    show_report_dialog(QApplication.activeWindow(), None)   # None → настройки из settings.json
+                except Exception:   # иначе ошибку окна отчёта молча проглотил бы обработчик исключений
+                    logging.getLogger("autoprint.app").exception("Окно «Сообщить об ошибке» не открылось")
+        finally:
+            crash_box_open = False
 
     setup_logging(on_crash=on_crash)
 

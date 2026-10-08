@@ -172,6 +172,38 @@ def is_own_window(hwnd: int) -> bool:
     return bool(hwnd) and window_pid(hwnd) == os.getpid()
 
 
+# ---------------------------------------------------------------- мышь во время печати
+# Клик проверяется опросом, а не низкоуровневым хуком мыши: хук на Python пропускает через себя
+# КАЖДОЕ движение мыши во всей системе, и если интерпретатор занят, курсор подтормаживает —
+# казалось, что программа «держит» мышь.
+_MOUSE_VKS = (0x01, 0x02, 0x04, 0x05, 0x06)   # левая, правая, средняя, X1, X2
+GA_ROOT = 2
+user32.GetCursorPos.argtypes = (ctypes.POINTER(wintypes.POINT),)
+user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetAncestor.argtypes = (wintypes.HWND, wintypes.UINT)
+user32.GetAncestor.restype = wintypes.HWND
+
+
+def mouse_pressed() -> bool:
+    """Кнопка мыши сейчас нажата. (Бит «нажата с прошлого опроса» не берём: он помнит и клик, которым
+    пользователь поставил курсор ДО старта, — печать вставала бы на паузу сразу.) Опрос — каждые ~20 мс,
+    обычный клик длится 60–150 мс."""
+    return any(user32.GetAsyncKeyState(vk) & 0x8000 for vk in _MOUSE_VKS)
+
+
+def cursor_over_own_window() -> bool:
+    """Курсор над окном самого AutoPrintCode (кнопки пульта, трей-меню и т. п.) — это не «вмешательство»."""
+    pt = wintypes.POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return False
+    hwnd = user32.WindowFromPoint(pt)
+    if not hwnd:
+        return False
+    root = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+    return is_own_window(root)
+
+
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
 kernel32.OpenProcess.restype = wintypes.HANDLE

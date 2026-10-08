@@ -5,7 +5,8 @@
 Единицы печати собираются настоящим build_units, затем «печатаются» в строковый буфер
 (char — вставка, back — Backspace, newline — Enter, fast/tab — отступ, cleanup/nav — ничего).
 Проверяется: итог совпадает с образцом, опечаток в среднем столько, сколько задано,
-опечатки не трогают скобки/кавычки/отступы/Enter, src_end не убегает вперёд.
+опечатки не трогают скобки/кавычки/отступы/Enter, src_end не убегает вперёд; ритм идёт
+очередями (слово быстро и ровно, разброс — в промежутках между словами), среднее k ≈ 1.
 Рабочая папка data/ не используется.
 """
 from __future__ import annotations
@@ -344,8 +345,9 @@ def test_rhythm() -> None:
     for name, text in (("python", PY), ("js", JS), ("prose", PROSE)):
         ks = [u.k for seed in range(20) for u in build(text, s, seed) if u.kind == "char" and len(u.text) == 1]
         mean = sum(ks) / len(ks)
+        # максимум — микропаузы между словами (k ≈ 3–6), внутри слов k < 1
         check(f"средний темп k ≈ 1: {name} ({mean:.3f}, разброс {min(ks):.2f}–{max(ks):.2f})",
-              0.95 <= mean <= 1.05 and min(ks) > 0.3 and max(ks) < 3)
+              0.95 <= mean <= 1.05 and min(ks) > 0.3 and max(ks) <= 7.0)
     units = build(PY, make_settings(typos_per_100=0.0), 1)
     caps = [u.k for u in units if u.kind == "char" and u.text.isupper()]
     check("заглавные медленнее среднего", sum(caps) / len(caps) > 1.0)
@@ -363,6 +365,84 @@ def test_rhythm() -> None:
                 notice.append(b.pause)
     check(f"пауза «заметил» 0.1–0.75 с (мин {min(notice):.2f}, макс {max(notice):.2f})",
           notice and min(notice) >= 0.1 and max(notice) <= 0.75)
+
+
+def typed_lines(units: list) -> list[list]:
+    """Строки набора: подряд идущие единицы char (без отступа); Enter, отступ и прочее их разделяют."""
+    out, cur = [], []
+    for u in units:
+        if u.kind == "char" and len(u.text) == 1:
+            if cur or not u.text.isspace():
+                cur.append(u)
+        else:
+            if cur:
+                out.append(cur)
+            cur = []
+    if cur:
+        out.append(cur)
+    return out
+
+
+def cv(xs: list[float]) -> float:
+    m = sum(xs) / len(xs)
+    return (sum((x - m) ** 2 for x in xs) / len(xs)) ** 0.5 / m
+
+
+def test_burst() -> None:
+    """Ритм очередями: слово быстро и ровно, разброс — в промежутках между словами."""
+    s = make_settings(typos_per_100=0.0)
+    seeds = 40
+    for name, text in (("python", PY), ("js", JS), ("prose", PROSE)):
+        inside, gaps, hes_pauses = [], [], []
+        runs = 0
+        for seed in range(seeds):
+            for ln in typed_lines(build(text, s, seed)):
+                run = 0             # промежутков подряд без заметной паузы
+                for a, b in zip(ln, ln[1:]):
+                    if is_word(a.text) and is_word(b.text):
+                        inside.append(a.k)                  # внутри слова
+                    elif a.text == " " and is_word(b.text):
+                        gaps.append(a.k)                    # пробел → слово
+                        if b.pause:
+                            hes_pauses.append(b.pause)
+                        if a.k < 2.5 and not b.pause:
+                            run += 1
+                        else:
+                            runs += run >= 2
+                            run = 0
+                    elif b.pause:
+                        hes_pauses.append(b.pause)          # заминка перед «"слово», «(x», «self.name»…
+                runs += run >= 2
+        m_in, m_gap = sum(inside) / len(inside), sum(gaps) / len(gaps)
+        cv_in, cv_gap = cv(inside), cv(gaps)
+        micro = sum(g >= 3 for g in gaps) / len(gaps)
+        hes = len(hes_pauses) / len(gaps)
+        check(f"очереди: {name}: внутри слова k {m_in:.2f} < 0.85, между словами {m_gap:.2f} > 1.5",
+              m_in < 0.85 and m_gap > 1.5)
+        check(f"очереди: {name}: внутри слова ровнее (CV {cv_in:.2f} против {cv_gap:.2f})", cv_in < 0.6 * cv_gap)
+        check(f"очереди: {name}: микропаузы (k ≥ 3) {micro:.1%} — не редкость и не на каждом шагу",
+              0.06 <= micro <= 0.3)
+        check(f"очереди: {name}: долгие заминки посреди строки {hes:.1%}, 0.25–0.9 с",
+              0.01 <= hes <= 0.08 and min(hes_pauses) >= 0.25 and max(hes_pauses) <= 0.9)
+        check(f"очереди: {name}: поток — 3+ слова подряд без пауз ({runs / seeds:.1f} раз на текст)",
+              runs / seeds >= 1)
+    # без пауз на обдумывание долгих заминок нет, но микропаузы между словами остаются
+    s = make_settings(typos_per_100=0.0, think_pause_s=0.0)
+    gaps = [a.k for seed in range(20) for ln in typed_lines(build(PROSE, s, seed))
+            for a, b in zip(ln, ln[1:]) if a.text == " " and is_word(b.text)]
+    micro = sum(g >= 3 for g in gaps) / len(gaps)
+    check(f"очереди: think_pause_s=0 — микропаузы остаются ({micro:.1%})", 0.06 <= micro <= 0.35)
+    # заданная скорость не врёт: среднее k ≈ 1 при опечатках и разных настройках
+    bad = []
+    for kw in (dict(typos_per_100=3.0), dict(profile=PROFILE_PLAIN, fast_indent=False),
+               dict(indent_with_tab=True, typos_per_100=1.5)):
+        for name, text in (("python", PY), ("js", JS), ("prose", PROSE)):
+            ks = [u.k for seed in range(10) for u in build(text, make_settings(**kw), seed)
+                  if u.kind == "char" and len(u.text) == 1]
+            mean = sum(ks) / len(ks)
+            if abs(mean - 1) > 0.1:
+                bad.append(f"{name} {kw}: {mean:.3f}")
+    check("среднее k ≈ 1 ± 0.1 при опечатках и разных отступах", not bad, "; ".join(bad))
 
 
 def test_passthrough() -> None:
@@ -392,6 +472,7 @@ def main() -> int:
     test_rate()
     test_gap_and_kinds()
     test_rhythm()
+    test_burst()
     test_passthrough()
     test_speed()
     print("ГОТОВО" if not fails else f"ПРОВАЛОВ: {fails}")

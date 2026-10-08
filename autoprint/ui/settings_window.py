@@ -145,6 +145,8 @@ class SettingsWindow(FramelessWindow):
     open_log = Signal()
     open_data = Signal()
     hotkey_capture = Signal(bool)
+    restart_requested = Signal()     # перезапустить программу (новый размер интерфейса)
+    report_requested = Signal()      # «Сообщить об ошибке»
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(f"{APP_NAME} — Настройки", minimize=True, maximize=True, parent=parent)
@@ -301,14 +303,19 @@ class SettingsWindow(FramelessWindow):
                   "следующая · По шагам — урок частями, с возвратом наверх. Есть и на пульте", [mode]))
         c.add(Row("lines", "Суфлёр", "Над лентой: что напечатается дальше и что сказать — комментарии шага "
                   "или строки (с «Без комментариев» они не печатаются)", [self._switch("show_prompter")]))
+        c.add(Row("next", "Шаги: к месту вставки", "Стрелками от курсора — код может продолжать уже написанный "
+                  "в файле, но между шагами курсор не трогать. От начала документа — переживает щелчки, "
+                  "но код должен начинаться с первой строки файла",
+                  [self._combo("step_nav", {"arrows": "Стрелками от курсора", "home": "От начала документа"},
+                               230)]))
         lay.addWidget(c)
         lay.addSpacing(12)
         lay.addWidget(Note(
             "<b>По шагам.</b> Слева от номеров строк — цветной номер шага. Шаг строки: правый щелчок по строке, "
             "<b>Alt+1…9</b> (Alt+0 — новый шаг) или кнопка «Шаги» в шапке блока — там же разметка по "
-            "комментариям одним щелчком. Хоткей старта печатает следующий шаг; программа сама переходит к "
-            "нужному месту (Ctrl+Home, стрелки), поэтому код должен начинаться с первой строки файла или ячейки, "
-            "а перенос длинных строк в редакторе — быть выключен. Пример — образец «Пример: пошаговый урок».",
+            "комментариям одним щелчком. Хоткей старта печатает следующий шаг; программа сама ведёт курсор к "
+            "месту вставки — как, задаёт строка «Шаги: к месту вставки» выше. Перенос длинных строк в редакторе "
+            "должен быть выключен. Пример — образец «Пример: пошаговый урок».",
             "help"))
         lay.addWidget(group_title("Темп"))
         c = Card()
@@ -556,6 +563,25 @@ class SettingsWindow(FramelessWindow):
         c.add(Row("contrast", "Тема оформления", "«Как в Windows» следует за светлой или тёмной темой системы",
                   [seg]))
         lay.addWidget(c)
+
+        lay.addWidget(group_title("Размер"))
+        c = Card()
+        scale = Segmented([(100, "100 %"), (125, "125 %"), (150, "150 %"), (175, "175 %")])
+        restart = button("Перезапустить сейчас", "refresh")
+        restart.setVisible(False)
+        restart.clicked.connect(self.restart_requested)
+        self._scale_at_start = self.s.ui_scale
+
+        def on_scale(v) -> None:
+            self._set("ui_scale", int(v))
+            restart.setVisible(int(v) != self._scale_at_start)
+        scale.changed.connect(on_scale)
+        self._loaders.append(lambda: scale.set_value(self.s.ui_scale))
+        c.add(Row("zoom", "Размер интерфейса", "Крупнее — всё окно целиком: текст, кнопки, значки. Применится "
+                  "после перезапуска программы", [scale, restart]))
+        c.add(Row("code", "Размер кода в блоке", "Ctrl или Shift + колёсико мыши над блоком — крупнее/мельче, "
+                  "Ctrl+0 — обычный размер, Ctrl+Shift+0 — все блоки образца", []))
+        lay.addWidget(c)
         self._finish(lay)
         return page
 
@@ -643,6 +669,9 @@ class SettingsWindow(FramelessWindow):
         b = button("Папка с данными", "folder")
         b.clicked.connect(self.open_data)
         row.addWidget(b)
+        b = button("Сообщить об ошибке", "bug")
+        b.clicked.connect(self.report_requested)
+        row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
         lay.addWidget(group_title("Как пользоваться"))
@@ -666,8 +695,8 @@ class SettingsWindow(FramelessWindow):
             f"4. Нажмите <b>{s.hotkey_toggle}</b> — начнётся набор. Ещё раз — пауза, ещё раз — продолжение.<br><br>"
             f"<b>{s.hotkey_restart or '—'}</b> — сначала · <b>{s.hotkey_stop or '—'}</b> — стоп · "
             f"<b>{s.hotkey_next_block or '—'}</b> / <b>{s.hotkey_prev_block or '—'}</b> — следующий / "
-            "предыдущий блок кода. Если во время печати сменилось окно или вы нажали клавишу — печать встанет "
-            "на паузу.")
+            "предыдущий блок кода. Если во время печати сменилось окно, вы нажали клавишу или щёлкнули мышью "
+            "вне программы — печать встанет на паузу.")
 
 
 def _quiet(w: QWidget, fn) -> None:

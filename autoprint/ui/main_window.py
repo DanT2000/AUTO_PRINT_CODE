@@ -36,7 +36,7 @@ log = logging.getLogger("autoprint")
 
 # настройки, после которых уже подготовленный текст нужно собрать заново
 REBUILD_KEYS = {"profile", "strip_comments", "human_typing", "typos_per_100", "think_pause_s", "tab_width",
-                "fast_indent", "indent_with_tab", "selection_whole_lines", "print_mode"}
+                "fast_indent", "indent_with_tab", "selection_whole_lines", "print_mode", "step_nav"}
 BUSY = (RUNNING, COUNTDOWN, PAUSED, LINE_WAIT)
 MODE_BLOCK, MODE_LINES, MODE_STEPS = "block", "lines", "steps"
 
@@ -76,11 +76,13 @@ class MainWindow(FramelessWindow):
         self.engine.countdown.connect(self._on_countdown)
         self.engine.finished.connect(self._on_finished)
         self.engine.target.connect(self._on_target)
+        self.engine.interrupted.connect(lambda _kind: self._notify("Пауза: вы кликнули мышью.", quiet=True))
         self.job: dict | None = None   # {kind, tid, bid, base, text, omap, src_len[, step]}
         self._target = ""
         self.step_next: dict[str, int | None] = {}   # id блока → какой шаг печатать следующим (None — все)
 
         self.guard = InputGuard()
+        self.engine.click_count = self.guard.click_count   # клики мышью во время печати (Raw Input)
         self.guard.tripped.connect(self._on_guard)
         self.guard.enter_pressed.connect(lambda: self.engine.continue_line(by_enter=True))
 
@@ -148,6 +150,10 @@ class MainWindow(FramelessWindow):
         self.btn_about = IconButton("info", "О программе", 17, box=32)
         self.btn_about.setObjectName("titleTool")
         self.btn_about.clicked.connect(lambda: self.open_settings("about"))
+        self.btn_report = IconButton("bug", "Сообщить об ошибке", 17, box=32)
+        self.btn_report.setObjectName("titleTool")
+        self.btn_report.clicked.connect(self.open_report)
+        tb.right.addWidget(self.btn_report)
         tb.right.addWidget(self.btn_settings)
         tb.right.addWidget(self.btn_about)
 
@@ -174,7 +180,8 @@ class MainWindow(FramelessWindow):
         ml.setContentsMargins(22, 16, 10, 0)
         ml.setSpacing(14)
         self.strip = ControlStrip()
-        self.strip.toggle_clicked.connect(lambda: self.cmd_toggle(from_button=True))
+        self.strip.toggle_clicked.connect(lambda: self.cmd_toggle(from_button=True, pressed=True))
+        self.strip.btn_toggle.pressed.connect(self._remember_press)
         self.strip.restart_clicked.connect(lambda: self.cmd_restart(from_button=True))
         self.strip.stop_clicked.connect(self.cmd_stop)
         self.strip.cpm_changed.connect(self._on_cpm)
@@ -226,6 +233,7 @@ class MainWindow(FramelessWindow):
         m.addSeparator()
         m.addAction(icons.icon("file-code"), "Добавить пример пошагового урока", self._add_steps_sample)
         m.addAction(icons.icon("lines"), "Все блоки — обычный размер\tCtrl+Shift+0", self._reset_zoom)
+        m.addAction(icons.icon("bug"), "Сообщить об ошибке…", self.open_report)
         m.addAction(icons.icon("file-text"), "Журнал работы", self._open_log)
         m.addAction(icons.icon("folder"), "Папка с данными", self._open_data_dir)
         m.addSeparator()
@@ -236,7 +244,8 @@ class MainWindow(FramelessWindow):
         menu = QMenu()
         menu.addAction("Показать окно", self._show_window)
         menu.addSeparator()
-        menu.addAction("Старт / пауза", lambda: self.cmd_toggle(from_button=False, countdown=3))
+        menu.addAction("Старт / пауза", lambda: self.cmd_toggle(from_button=False, countdown=3, pressed=True))
+        menu.aboutToShow.connect(self._remember_press)
         menu.addAction("Стоп", self.cmd_stop)
         menu.addSeparator()
         self.tray_update = menu.addAction("Обновление…", self.open_update_dialog)
@@ -397,6 +406,8 @@ class MainWindow(FramelessWindow):
             w.open_log.connect(self._open_log)
             w.open_data.connect(self._open_data_dir)
             w.hotkey_capture.connect(self._on_hotkey_capture)
+            w.restart_requested.connect(self._restart_app)
+            w.report_requested.connect(self.open_report)
             w.closed.connect(self._on_settings_closed)
             self.settings_win = w
             # поверх главного окна, по центру
@@ -680,6 +691,21 @@ class MainWindow(FramelessWindow):
         except OSError as e:
             QMessageBox.warning(self, "Экспорт", str(e))
 
+    def _restart_app(self) -> None:
+        """Перезапуск программы (новый размер интерфейса) — тем же путём, что после обновления."""
+        if self._busy_typing() and QMessageBox.question(
+                self, APP_NAME, "Сейчас идёт печать. Остановить её и перезапустить программу?") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self._save_settings()
+        self._restart()
+
+    def open_report(self) -> None:
+        """Отчёт об ошибке: журнал и сведения о системе без личных данных → zip или задача на GitHub."""
+        from .report_dialog import show_report_dialog
+        show_report_dialog(self.settings_win if self.settings_win and self.settings_win.isActiveWindow()
+                           else self, self.settings)
+
     def _open_log(self) -> None:
         import os
         from ..logs import LOG_FILE
@@ -841,7 +867,19 @@ class MainWindow(FramelessWindow):
         prev = nums[-1] if k is None else next((n for n in reversed(nums) if n < k), nums[0])
         self._set_step_pointer(block.id, prev)
         i, n = self._step_index(block, prev)
-        self._notify(f"Следующим будет шаг {i} из {n}. Если он уже напечатан — сотрите его в редакторе.",
+        where = ""
+        if self.settings.step_nav != "home":
+            # стрелки отсчитываются от курсора: после стирания он мог остаться где угодно — подскажем где
+            lines = self._lines_of(block)
+            cur = S.cursor_before(lines, prev)
+            if cur is None:
+                where = " и поставьте курсор туда, где начинался урок"
+            else:
+                doc = [sl.typed for sl in lines if sl.typed is not None and sl.step < prev]
+                txt = doc[cur].strip()
+                txt = f" «{txt[:40]}{'…' if len(txt) > 40 else ''}»" if txt else " (пустой)"
+                where = f", затем поставьте курсор в конец строки {cur + 1} урока{txt}"
+        self._notify(f"Следующим будет шаг {i} из {n}. Если он уже напечатан — сотрите его в редакторе{where}.",
                      tray=not self.isActiveWindow())
 
     # ---- пульт и суфлёр
@@ -971,10 +1009,10 @@ class MainWindow(FramelessWindow):
             text, st, lang = block.text, list(block.steps), block.lang
 
             def build(s: Settings, text=text, st=st, lang=lang, k=k):
-                return S.build_step_units(S.analyze(text, st, lang, s.strip_comments), k, s)
+                return S.build_step_units(S.analyze(text, st, lang, s.strip_comments), k, s, s.step_nav)
             job = {"kind": MODE_STEPS, "tid": v.template.id, "bid": block.id, "step": k, "base": 0, "text": text,
                    "omap": None, "src_len": len(text), "builder": build,
-                   "key": (tuple(st), k, self.settings.strip_comments)}
+                   "key": (tuple(st), k, self.settings.strip_comments, self.settings.step_nav)}
             if not build(self.settings):
                 job["empty"] = True   # в шаге только комментарии — печатать нечего, это «слова»
             return job
@@ -1022,8 +1060,28 @@ class MainWindow(FramelessWindow):
         tail = f" Дальше — шаг {i + 1}." if nxt is not None else " Шаги кончились."
         self._notify(f"Шаг {i} из {n} — только слова, кода в нём нет.{tail}", tray=not self.isActiveWindow())
 
-    def cmd_toggle(self, from_button: bool = False, countdown: int | None = None) -> None:
+    def _remember_press(self) -> None:
+        """Состояние в момент нажатия кнопки «Пауза» (или открытия меню трея): пока кнопку отпускают,
+        окно программы становится активным, и печать сама встаёт на паузу (сменилось окно)."""
         st = self.engine.state
+        if st == PAUSED and time.monotonic() - self.engine.auto_paused_at < 1.0:
+            # печать встала на паузу сама от этого же щелчка: значок в трее — окно Проводника, щелчок по
+            # нему — «клик мышью»; окно программы при нажатии стало активным — «сменилось окно».
+            # До щелчка печать шла
+            st = RUNNING
+        self._press_state = st
+
+    def cmd_toggle(self, from_button: bool = False, countdown: int | None = None,
+                   pressed: bool = False) -> None:
+        st = self.engine.state
+        press_state, self._press_state = getattr(self, "_press_state", None), None
+        if pressed and press_state in (RUNNING, COUNTDOWN) and st not in (RUNNING, COUNTDOWN):
+            # нажимали «Пауза» во время печати — оставить паузу, а не продолжить (раньше кнопка ставила
+            # паузу и тут же снова запускала печать с отсчётом и сворачиванием окна). Если, пока кнопку
+            # отпускали, блок допечатался или строка дошла до ожидания Enter, — тоже ничего не запускать
+            if st == PAUSED:
+                self._notify("Пауза.", quiet=True)
+            return
         if st == LINE_WAIT:
             # по строкам: хоткей или кнопка = «следующая строка» — как продолжение после паузы
             # (задержка хоткея, с кнопки — отсчёт и сворачивание окна, чтобы фокус вернулся в редактор)

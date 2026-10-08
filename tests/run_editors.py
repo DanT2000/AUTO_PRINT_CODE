@@ -26,8 +26,10 @@ from autoprint import winapi as w
 app = QCoreApplication([])
 
 PAGES = ROOT / "tests" / "pages"
+# порт — любой свободный: фиксированный (8765) Windows может держать в зарезервированном диапазоне
 _server = http.server.ThreadingHTTPServer(
-    ("127.0.0.1", 8765), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(PAGES)))
+    ("127.0.0.1", 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(PAGES)))
+PORT = _server.server_address[1]
 threading.Thread(target=_server.serve_forever, daemon=True).start()
 
 import ctypes
@@ -139,7 +141,7 @@ CHROME = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
 
 
 def run_browser(name, page, lang, code, cpm=1500):
-    url = f"http://127.0.0.1:8765/{page}#{lang}"
+    url = f"http://127.0.0.1:{PORT}/{page}#{lang}"
     subprocess.Popen([CHROME, "--new-window", f"--app={url}", f"--user-data-dir={SP}/chrome-profile",
                       "--no-first-run", "--no-default-browser-check"])
     if not wait_fg("ready", 40):

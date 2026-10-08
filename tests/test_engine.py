@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -40,7 +41,7 @@ from autoprint import winapi as W  # noqa: E402
 from autoprint.comments import comment_spans  # noqa: E402
 from autoprint.storage import (BLOCK_CODE, PROFILE_IDE, PROFILE_PLAIN, Block, Settings, Template,  # noqa: E402
                                TemplateStore)
-from autoprint.typer import FINISHED, IDLE, LINE_WAIT, RUNNING, TypingEngine  # noqa: E402
+from autoprint.typer import FINISHED, IDLE, LINE_WAIT, RUNNING, TypingEngine, build_units  # noqa: E402
 
 failed: list[str] = []
 
@@ -64,8 +65,9 @@ class Editor:
     def __init__(self) -> None:
         self.reset()
 
-    def reset(self, ide: bool = False) -> None:
+    def reset(self, ide: bool = False, tags: bool = False) -> None:
         self.lines, self.r, self.c, self.sel, self.ide = [""], 0, 0, None, ide
+        self.tags = tags                  # как HTML в VS Code: после «<div>» справа появляется «</div>»
         self.held: set[int] = set()
         self.bad: list[str] = []          # нажатия с зажатым Ctrl — так печать идти не должна
         self.lock = threading.Lock()
@@ -88,6 +90,9 @@ class Editor:
             self._del_sel()
             ln = self.lines[self.r]
             closer = {"(": ")", "[": "]", "{": "}", '"': '"', "'": "'"}.get(ch, "") if self.ide else ""
+            m = re.search(r"<(\w+)>$", ln[:self.c] + ch) if self.tags else None
+            if m:
+                closer = f"</{m.group(1)}>"
             self.lines[self.r] = ln[:self.c] + ch + closer + ln[self.c:]
             self.c += 1
 
@@ -158,6 +163,10 @@ def _wait_mods(timeout: float = 5.0) -> bool:
 
 
 W.wait_modifiers_released = _wait_mods
+# клики мыши — подменены (настоящая мышь тесту не мешает); clicks — счётчик Raw Input (guard.click_count)
+MOUSE = {"down": False, "own": False, "clicks": 0}
+W.mouse_pressed = lambda: MOUSE["down"]
+W.cursor_over_own_window = lambda: MOUSE["own"]
 DELAY = {"s": 0.0}
 TypingEngine._delay_after = lambda self, u: DELAY["s"]   # быстро: темп здесь не проверяется
 TypingEngine._gap = lambda self: 0.0005
@@ -185,6 +194,9 @@ class FakeGuard(QObject):
 
     def shutdown(self) -> None:
         self.armed = self.watching = False
+
+    def click_count(self) -> int:
+        return MOUSE["clicks"]
 
 
 class FakeHotkeys(QObject):
@@ -269,8 +281,56 @@ def steps_lesson(profile: str, strip: bool) -> None:
     check(f"по шагам, {profile}, без комментариев={strip}: в редакторе ровно шаги 1…k", ok, detail)
     check(f"по шагам, {profile}: после урока все шаги напечатаны, защита снята",
           win._step_pointer(b.id) is None and not win.guard.armed and not win.guard.watching)
+    # «шаг назад» со стрелками: подсказка, куда поставить курсор после стирания шага
+    notes: list[str] = []
+    win._notify = lambda text, **_k: notes.append(text)
+    win.cmd_step_back()
+    check(f"по шагам, {profile}: «шаг назад» подсказывает, где оставить курсор",
+          bool(notes) and "в конец строки" in notes[-1], notes[-1:] or "нет сообщения")
     win.close()
     pump()
+
+
+def run_units(units, s: Settings) -> None:
+    """Единицы — прямо в эмулятор (как поток печати, но без пауз и состояний)."""
+    e = TypingEngine(s)
+    for u in units:
+        e._execute(u)
+
+
+def steps_blank_chunk() -> None:
+    """Шаг, кусок которого — одна пустая строка: автоотступ после Enter не должен «съесть» следующую вставку."""
+    text = "def f():\n    a = 1\n\n    b = 2\n    c = 3"
+    steps = [1, 1, 2, 1, 2]
+    for nav in ("arrows", "home"):
+        ED.reset(ide=True)
+        s = Settings()
+        s.profile, s.human_typing = PROFILE_IDE, False
+        lines = S.analyze(text, steps, "python", False)
+        got = []
+        for k in (1, 2):
+            run_units(S.build_step_units(lines, k, s, nav), s)
+            got.append(ED.text)
+        exp = ["def f():\n    a = 1\n    b = 2", text]
+        check(f"по шагам ({nav}): кусок из одной пустой строки — код не теряется", got == exp,
+              f"\n  есть {got!r}\n  ждём {exp!r}")
+    # пустая строка — последний кусок шага: в ней не остаётся отступа
+    ED.reset(ide=True)
+    lines = S.analyze("def g():\n    x = 1\n", [1, 1, 2], "python", False)
+    for k in (1, 2):
+        run_units(S.build_step_units(lines, k, s, "arrows"), s)
+    check("по шагам: пустая строка в конце шага — без хвоста пробелов", ED.text == "def g():\n    x = 1\n",
+          repr(ED.text))
+
+
+def closing_tag_tail() -> None:
+    """Профиль IDE: закрывающий тег, который редактор дописал после «>», не остаётся лишним в коде."""
+    code = "<t>\n    1 + 2\n</t>"
+    ED.reset(ide=True, tags=True)
+    s = Settings()
+    s.profile, s.human_typing = PROFILE_IDE, False
+    run_units(build_units(code, s), s)
+    check("закрывающий тег от редактора (HTML) — не дублируется", ED.text == code, repr(ED.text))
 
 
 def lines_block(profile: str, strip: bool, hotkey_with_ctrl: bool) -> None:
@@ -400,8 +460,128 @@ def comments_speed() -> None:
           len(spans) == 550, f"{ms:.1f} мс, комментариев {len(spans)}")
 
 
+def smooth_newlines() -> None:
+    """Профиль IDE: лишних служебных нажатий нет — после Enter автоотступ не трогают до первого символа
+    (иначе строка «прыгает» во время паузы), «пробел + Backspace» — только где могла быть подсказка."""
+    code = "def total(nums):\n    s = 0\n    for n in nums:\n        s += n\n\n    return s"
+    ED.reset(ide=True)
+    log: list[str] = []
+    orig_char, orig_tap = W.type_char, W.tap
+
+    def char(ch: str) -> None:
+        log.append(f"char:{ch}")
+        orig_char(ch)
+
+    def tap(vk: int, *mods: int) -> None:
+        log.append(("shift+" if W.VK_SHIFT in mods else "") + KEYS[vk])
+        orig_tap(vk, *mods)
+    W.type_char, W.tap = char, tap
+    try:
+        s = Settings()
+        s.profile, s.human_typing = PROFILE_IDE, False
+        e = TypingEngine(s)
+        e.load(code)
+        e.start()
+        wait_for(lambda: e.state == FINISHED, 10)
+    finally:
+        W.type_char, W.tap = orig_char, orig_tap
+    check("плавный перенос: текст точно как в образце", ED.text == code, repr(ED.text))
+    pairs = sum(1 for a, b in zip(log, log[1:]) if a == "char: " and b == "back")
+    # «пробел + Backspace» нужен только перед «)» после «nums», перед Enter после «s += n» и в конце после «s»
+    # (после «s = 0» — нет: у чисел подсказок автодополнения не бывает)
+    check("плавный перенос: «пробел + стереть» только где нужно", pairs == 3, f"{pairs} раз; было бы 11")
+    after_enter = [log[i + 1] for i, x in enumerate(log[:-1]) if x == "enter"]
+    check("плавный перенос: сразу после Enter отступ не трогают", all(x != "char: " for x in after_enter),
+          after_enter)
+
+
+def mouse_click_pauses() -> None:
+    """Клик мышью в редакторе во время печати — пауза; клик по окну самой программы — нет."""
+    ED.reset(ide=False)
+    s = Settings()
+    s.profile, s.human_typing = PROFILE_PLAIN, False
+    e = TypingEngine(s)
+    hits: list[str] = []
+    e.interrupted.connect(hits.append)
+    DELAY["s"] = 0.03
+    try:
+        e.load("x" * 200)
+        e.start()
+        wait_for(lambda: e.state == RUNNING, 5)
+        MOUSE.update(down=True, own=True)        # кнопка «Пауза» в окне программы — не вмешательство
+        pump(0.2)
+        own_ok = e.state == RUNNING
+        MOUSE.update(down=True, own=False)       # клик в редакторе
+        paused = wait_for(lambda: e.state == "paused", 3)
+        MOUSE.update(down=False, own=False)
+        pump(0.1)
+        e.stop()
+    finally:
+        DELAY["s"] = 0.0
+        MOUSE.update(down=False, own=False)
+    check("клик по окну программы не ставит паузу", own_ok)
+    check("клик мышью в редакторе — пауза", paused and hits == ["mouse"], hits)
+
+    # короткий тап (кнопка уже отпущена к опросу) — виден по счётчику Raw Input
+    e = TypingEngine(s)
+    e.click_count = lambda: MOUSE["clicks"]
+    hits.clear()
+    e.interrupted.connect(hits.append)
+    DELAY["s"] = 0.03
+    try:
+        MOUSE["clicks"] += 1                     # клик до старта (поставили курсор) — не вмешательство
+        e.load("y" * 200)
+        e.start()
+        wait_for(lambda: e.state == RUNNING, 5)
+        pump(0.2)
+        before_ok = e.state == RUNNING
+        MOUSE["clicks"] += 1                     # тап тачпада во время печати
+        tapped = wait_for(lambda: e.state == "paused", 3)
+        MOUSE["clicks"] += 1                     # щёлкнули в редакторе на паузе, потом продолжили
+        e.resume()
+        wait_for(lambda: e.state == RUNNING, 5)
+        pump(0.2)
+        resumed = e.state
+        e.stop()
+    finally:
+        DELAY["s"] = 0.0
+    check("клик до старта печати не ставит паузу", before_ok)
+    check("короткий тап во время печати — пауза", tapped and hits[:1] == ["mouse"], hits)
+    check("клик на паузе не мешает продолжить", resumed == RUNNING and hits == ["mouse"], f"{resumed} {hits}")
+
+
+def tray_click_keeps_pause() -> None:
+    """«Старт / пауза» из меню трея во время печати: щелчок по значку (окно Проводника) уже поставил паузу
+    «кликом мышью» — пункт меню её оставляет, а не продолжает печать."""
+    ED.reset()
+    win, s, store = make_window(PROFILE_PLAIN)
+    win.open_template(store.templates[0].id)
+    pump()
+    DELAY["s"] = 0.03
+    try:
+        win.cmd_toggle()
+        wait_for(lambda: win.engine.state == RUNNING, 5)
+        MOUSE["clicks"] += 1                     # правый щелчок по значку в трее
+        wait_for(lambda: win.engine.state == "paused", 3)
+        win._remember_press()                    # меню открылось (aboutToShow)
+        win.cmd_toggle(countdown=0, pressed=True)   # пункт «Старт / пауза»
+        pump(0.3)
+        st = win.engine.state
+    finally:
+        DELAY["s"] = 0.0
+        win.cmd_stop()
+    check("меню трея «Старт / пауза» во время печати — пауза остаётся", st == "paused", st)
+    win.close()
+    pump()
+
+
 def main() -> int:
     theme.setup(app, "dark")
+    smooth_newlines()
+    mouse_click_pauses()
+    tray_click_keeps_pause()
+    steps_blank_chunk()
+    closing_tag_tail()
     for profile in (PROFILE_PLAIN, PROFILE_IDE):
         for strip in (False, True):
             steps_lesson(profile, strip)

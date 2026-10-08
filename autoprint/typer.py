@@ -31,6 +31,14 @@ PUNCT = set(",;:)]}>")
 # Профиль IDE: перед этими символами очищается правая часть строки (там может быть
 # только то, что редактор дописал сам — автоскобки и автокавычки).
 CLEAR_BEFORE = set(")]}\"'`")
+# После этих символов редактор может дописать справа закрывающую пару (автоскобки, автокавычки).
+OPENERS = set("([{\"'`")
+CLOSE_BRACKETS = set(")]}")
+
+
+def _ident_char(ch: str) -> bool:
+    """После буквы, цифры или «_» редактор мог открыть подсказку автодополнения: Enter её бы принял."""
+    return bool(ch) and (ch.isalnum() or ch == "_")
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +47,8 @@ LINE_WAIT = "line_wait"   # печать по строкам: строка го�
 
 # клавиши перемещения (единицы «nav», печать по шагам) → (vk, модификаторы)
 NAV_KEYS = {"ctrl_home": (w.VK_HOME, (w.VK_CONTROL,)), "ctrl_end": (w.VK_END, (w.VK_CONTROL,)),
-            "down": (w.VK_DOWN, ()), "up": (w.VK_UP, ()), "end": (w.VK_END, ()), "enter_raw": (w.VK_RETURN, ())}
+            "down": (w.VK_DOWN, ()), "up": (w.VK_UP, ()), "end": (w.VK_END, ()), "home": (w.VK_HOME, ()),
+            "enter_raw": (w.VK_RETURN, ())}
 
 
 @dataclass
@@ -105,6 +114,7 @@ class TypingEngine(QObject):
     sound = Signal(str)
     finished = Signal()
     target = Signal(str)               # имя exe окна, в которое идёт печать (для пульта)
+    interrupted = Signal(str)          # пауза из-за пользователя: "mouse" — клик мышью вне окна программы
 
     def __init__(self, settings: Settings) -> None:
         super().__init__()
@@ -122,7 +132,17 @@ class TypingEngine(QObject):
         self._target_hwnd = 0
         self._line_go = threading.Event()   # печать по строкам: «дальше» (Enter пользователя или хоткей)
         self._line_by_enter = False
+        # профиль IDE — что могло остаться в строке редактора (чтобы не делать лишних служебных нажатий):
+        self._dirty = False            # справа могут быть дописанные редактором скобки/кавычки
+        self._last_ident = False       # последней была буква/цифра — могла открыться подсказка
+        self._indent_pending = False   # после Enter — автоотступ редактора ещё не заменён
+        self._in_word = self._word_alpha = False   # идёт слово; начато с буквы (у чисел подсказок нет)
         self.job_key = None    # чем занят движок (id блока) — для UI
+        # счётчик нажатий кнопок мыши не над окном программы (guard.InputGuard.click_count, Raw Input):
+        # ловит и короткий тап тачпада между опросами кнопок. Клики до старта/продолжения не считаются
+        self.click_count = lambda: 0
+        self._clicks_seen = 0
+        self.auto_paused_at = float("-inf")   # когда печать сама встала на паузу (клик, смена окна)
 
     # ------------------------------------------------------------ API (GUI-поток)
     def load(self, text: str, job_key=None, builder=None) -> None:
@@ -255,15 +275,17 @@ class TypingEngine(QObject):
         return gen == self._gen
 
     def _sleep(self, gen: int, seconds: float) -> bool:
-        """Сон, прерываемый остановкой. False — если печать отменена."""
+        """Сон, прерываемый остановкой (и кликом мышью — пауза). False — если печать отменена."""
         end = time.perf_counter() + seconds
         while True:
             if not self._alive(gen):
                 return False
+            if self._mouse_interrupt(gen):
+                return True
             left = end - time.perf_counter()
             if left <= 0:
                 return True
-            time.sleep(min(left, 0.05))
+            time.sleep(min(left, 0.02))
 
     def _think(self, gen: int, seconds: float) -> bool:
         """Пауза-обдумывание: обрывается, если поставили на паузу. False — если печать отменена."""
@@ -271,11 +293,34 @@ class TypingEngine(QObject):
         while self._run.is_set():
             if not self._alive(gen):
                 return False
+            if self._mouse_interrupt(gen):
+                break
             left = end - time.perf_counter()
             if left <= 0:
                 break
-            time.sleep(min(left, 0.05))
+            time.sleep(min(left, 0.02))
         return self._alive(gen)
+
+    def _mouse_interrupt(self, gen: int) -> bool:
+        """Клик мышью вне окна программы во время печати — пауза: курсор в редакторе мог сместиться.
+        Клики по самой программе (кнопка «Пауза», её меню) не в счёт — они управляют печатью.
+        Нажатие видно двумя путями: счётчик Raw Input (ловит и короткий тап) и опрос «кнопка нажата сейчас»."""
+        clicks = self.click_count()
+        if self.state != RUNNING or not self.settings.guard_enabled or not self._alive(gen):
+            self._clicks_seen = clicks
+            return False
+        clicked, self._clicks_seen = clicks != self._clicks_seen, clicks
+        if not clicked and (not w.mouse_pressed() or w.cursor_over_own_window()):
+            return False
+        self.auto_paused_at = time.monotonic()
+        self._pause_from_worker(gen)
+        log.info("Пауза (клик мышью) на %d/%d", self._pos, len(self._units))
+        self.interrupted.emit("mouse")
+        return True
+
+    def _forget_clicks(self) -> None:
+        """Печать (снова) пошла: клики, которыми курсор ставили до этого, — не вмешательство."""
+        self._clicks_seen = self.click_count()
 
     def _prepare(self, gen: int, delay: float, countdown: int, next_line: bool = False) -> int | None:
         """Отсчёт, ожидание отпускания модификаторов, захват целевого окна.
@@ -309,6 +354,7 @@ class TypingEngine(QObject):
             self.message.emit("Окно запущено от имени администратора — Windows не пропустит в него ввод. "
                               "Запустите AutoPrintCode тоже от имени администратора.")
             return None
+        self._forget_clicks()
         if not next_line:
             log.info("Печать %s с %d/%d → %s · профиль=%s · %d симв/мин",
                      "продолжена" if self._pos else "начата", self._pos, len(self._units),
@@ -323,6 +369,7 @@ class TypingEngine(QObject):
             self._wset(gen, PAUSED)
 
     def _worker(self, gen: int, delay: float, countdown: int) -> None:
+        self._dirty = self._last_ident = self._indent_pending = self._in_word = False
         target = self._prepare(gen, delay, countdown)
         if target is None:
             if self._wset(gen, PAUSED if self._pos else IDLE):
@@ -337,7 +384,9 @@ class TypingEngine(QObject):
         waited = -1     # перед какой единицей «дальше» (Enter пользователя или хоткей) уже получено
         entered = -1    # перед какой единицей пользователь сам нажал Enter — повторно не нажимаем
         while self._alive(gen) and self._pos < len(self._units):
-            if not self._run.is_set():
+            # «Пауза» при поднятом _run — «продолжить» пришло сразу после паузы, которую поставил сам поток
+            # (клик, смена окна): всё равно пройти подготовку — окно, отсчёт, состояние «Печатает»
+            if not self._run.is_set() or self.state == PAUSED:
                 self._run.wait()
                 if not self._alive(gen):
                     return
@@ -372,10 +421,15 @@ class TypingEngine(QObject):
                     return
                 thought = self._pos
                 continue
-            if self.settings.autopause_on_focus_change and w.foreground_window() != target:
+            if self._mouse_interrupt(gen):
+                continue
+            fg = w.foreground_window()
+            # в окно самой программы печатать нельзя никогда (набор правил бы образец) — даже если
+            # автопауза при смене окна выключена
+            if fg != target and (self.settings.autopause_on_focus_change or w.is_own_window(fg)):
+                self.auto_paused_at = time.monotonic()
                 self._pause_from_worker(gen)
-                log.info("Пауза (сменилось окно → %s) на %d/%d", w.describe_window(w.foreground_window()),
-                         self._pos, len(self._units))
+                log.info("Пауза (сменилось окно → %s) на %d/%d", w.describe_window(fg), self._pos, len(self._units))
                 self.message.emit("Пауза: сменилось активное окно. Вернитесь в нужное окно и продолжите.")
                 continue
             try:
@@ -396,9 +450,12 @@ class TypingEngine(QObject):
     def _wait_line(self, gen: int) -> bool:
         """Печать по строкам: строка набрана — ждём «дальше». False — если печать отменена."""
         if self.settings.profile == PROFILE_IDE:
-            # убрать дописанное редактором справа и закрыть подсказки — иначе Enter пользователя
-            # примет автодополнение вместо новой строки
-            self._clear_right()
+            # убрать дописанное редактором справа (автоскобки, закрывающий тег после «>», « */» после «/**»)
+            # и закрыть подсказки — иначе Enter пользователя примет автодополнение вместо новой строки
+            if self._indent_pending:
+                self._clear_indent()
+            else:
+                self._clear_right()
         self._line_go.clear()
         self._line_by_enter = False
         if not self._wset(gen, LINE_WAIT):
@@ -406,59 +463,120 @@ class TypingEngine(QObject):
         while not self._line_go.wait(0.05):
             if not self._alive(gen):
                 return False
+        self._forget_clicks()   # щёлкнуть в редакторе, пока ждали Enter, можно: строка пойдёт от курсора
         # сразу «Печатает»: защита снова ловит случайные клавиши, пока ждём отпускания Ctrl после хоткея
         return self._wset(gen, RUNNING)
+
+    def _start_line_text(self, u: Unit) -> None:
+        """Профиль IDE: перед первым символом строки убрать автоотступ редактора. Не сразу после Enter, а
+        здесь — иначе во время паузы «на обдумывание» строка стояла бы без отступа, а потом он впрыгивал
+        (рывок). Автоотступ выделяется (Shift+Home), и первый набранный символ его заменяет."""
+        self._indent_pending = False
+        replace = u.kind == "fast" or (u.kind == "char" and u.text not in OPENERS and u.text not in CLEAR_BEFORE)
+        if replace:
+            w.tap(w.VK_HOME, w.VK_SHIFT)
+            time.sleep(self._gap())
+        else:   # Tab с выделением сдвинул бы строки, а скобка/кавычка — «обернула» бы выделение
+            self._clear_indent()
 
     def _execute(self, u: Unit, gen: int | None = None, enter_done: bool = False) -> None:
         s = self.settings
         ide = s.profile == PROFILE_IDE
+        if ide and self._indent_pending and u.kind not in ("newline", "cleanup", "nav"):
+            self._start_line_text(u)
         if u.kind == "char":
             if ide and u.text in CLEAR_BEFORE:
                 # не полагаемся на «перепечатывание» автоскобок — оно у редакторов разное
-                # (CodeMirror 6 ломает тройные кавычки): убираем дописанное справа и вставляем символ
-                self._clear_right()
+                # (CodeMirror 6 ломает тройные кавычки): убираем дописанное справа и вставляем символ.
+                # Но только когда справа может что-то быть — лишние нажатия видны как дёрганье.
+                if self._last_ident:
+                    self._clear_right()      # могла открыться подсказка автодополнения — закрыть
+                elif self._dirty:
+                    if u.text in CLOSE_BRACKETS:
+                        w.tap(w.VK_END, w.VK_SHIFT)   # выделить дописанное — скобка его заменит
+                        time.sleep(self._gap())
+                    else:
+                        self._clear_right()  # кавычка с выделением «обернула» бы его
+                self._dirty = False
             w.type_char(u.text) if len(u.text) == 1 else self._fast(u.text, gen)
             self.sound.emit("space" if u.text == " " else "key")
+            if ide:
+                ch = u.text[-1:]
+                if ch in OPENERS:
+                    self._dirty = True      # редактор мог дописать справа закрывающую пару
+                if _ident_char(ch):
+                    if not self._in_word:   # подсказки бывают у слов с буквы/«_», у чисел — нет
+                        self._in_word, self._word_alpha = True, not ch.isdigit()
+                    self._last_ident = self._word_alpha
+                else:
+                    self._in_word = self._last_ident = False
         elif u.kind == "fast":
             self.sound.emit("space")
             self._fast(u.text, gen)
+            self._last_ident = self._in_word = False
         elif u.kind == "tab":
             w.tap(w.VK_TAB)
             self.sound.emit("key")
+            self._last_ident = self._in_word = False
         elif u.kind == "back":
             w.tap(w.VK_BACK)
             self.sound.emit("key")
         elif u.kind == "nav":
             # печать по шагам: перейти к месту вставки (без звука — так обычно щёлкают мышью)
+            if ide and self._indent_pending:
+                self._clear_indent()   # кусок из одной пустой строки: автоотступ не оставлять в ней
             vk, mods = NAV_KEYS[u.text]
             w.tap(vk, *mods)
         elif u.kind == "newline":
             if not enter_done:   # печать по строкам: Enter пользователь уже нажал сам
                 if ide:
-                    self._clear_right()
                     if s.esc_before_enter:
                         w.tap(w.VK_ESCAPE)
                         time.sleep(self._gap())
+                    if self._indent_pending:
+                        # пустая строка: автоотступ выделить — Enter заменит его, хвостов пробелов не будет
+                        w.tap(w.VK_HOME, w.VK_SHIFT)
+                        time.sleep(self._gap())
+                    elif self._last_ident:
+                        self._clear_right()   # закрыть подсказку: иначе Enter её примет; заодно хвост
+                    else:
+                        # что редактор дописал справа (скобки, кавычки, закрывающий тег после «>», « */»
+                        # после «/**») — выделить, Enter заменит. Если справа пусто, нажатие ничего не меняет
+                        w.tap(w.VK_END, w.VK_SHIFT)
+                        time.sleep(self._gap())
                 w.tap(w.VK_RETURN)
                 self.sound.emit("enter")
+            self._dirty = self._last_ident = self._in_word = False
             if ide:
                 time.sleep(self._gap() * 2)  # дать редактору вставить автоотступ
-                w.tap(w.VK_HOME, w.VK_SHIFT)
-                time.sleep(self._gap())
-                w.type_char(" ")
-                time.sleep(self._gap())
-                w.tap(w.VK_BACK)
-                time.sleep(self._gap())
+                self._indent_pending = True   # уберём его перед первым символом новой строки
         elif u.kind == "cleanup":
-            self._clear_right()
+            if self._indent_pending:
+                self._clear_indent()
+            else:
+                self._clear_right()   # конец печати: хвост, дописанный редактором, и подсказки — убрать
+            self._indent_pending = self._dirty = self._last_ident = False
 
     def _clear_right(self) -> None:
+        """Стереть всё справа от курсора до конца строки и закрыть подсказки: Shift+End, пробел, Backspace.
+        Безопасно и при пустом выделении (в отличие от Delete, который склеил бы строки)."""
         w.tap(w.VK_END, w.VK_SHIFT)
         time.sleep(self._gap())
         w.type_char(" ")
         time.sleep(self._gap())
         w.tap(w.VK_BACK)
         time.sleep(self._gap())
+        self._dirty = self._last_ident = self._in_word = False
+
+    def _clear_indent(self) -> None:
+        """Убрать автоотступ в начале строки: Shift+Home, пробел, Backspace."""
+        w.tap(w.VK_HOME, w.VK_SHIFT)
+        time.sleep(self._gap())
+        w.type_char(" ")
+        time.sleep(self._gap())
+        w.tap(w.VK_BACK)
+        time.sleep(self._gap())
+        self._indent_pending = False
 
     def _gap(self) -> float:
         return max(5, self.settings.key_gap_ms) / 1000
@@ -475,8 +593,11 @@ class TypingEngine(QObject):
         base = 60.0 / max(30, s.cpm)
         j = max(0, min(90, s.jitter)) / 100
         if s.human_typing:
-            # логнормальный разброс: в основном ровно, изредка заметная заминка; среднее = base·k
-            sigma = 0.1 + 0.5 * j
+            # ритм (очереди слов и паузы между ними) задаёт human.py через k. Внутри слова k < 1 — шум
+            # слабый, чтобы очередь оставалась ровной; на промежутках (k ≥ 2) — полный, разброс там уместен.
+            # Логнормальный множитель со средним 1 — скорость в среднем не меняется
+            lo, hi = 0.06 + 0.2 * j, 0.1 + 0.5 * j
+            sigma = lo + (hi - lo) * min(1.0, max(0.0, u.k - 1.0))
             d = base * u.k * random.lognormvariate(-sigma * sigma / 2, sigma)
         else:
             d = base * random.uniform(1 - j, 1 + j)

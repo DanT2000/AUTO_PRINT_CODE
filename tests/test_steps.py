@@ -75,6 +75,11 @@ class Editor:
             self.c = min(self.c, len(self.lines[self.r]))
         elif name == "end":
             self.c = len(self.lines[self.r])
+        elif name == "home":
+            # «умный» Home как в VS Code: сначала к началу текста строки, повторно — в столбец 0
+            ln = self.lines[self.r]
+            first = len(ln) - len(ln.lstrip(" \t"))
+            self.c = first if self.c != first else 0
         elif name == "enter_raw":
             self.enter()
         else:
@@ -116,14 +121,20 @@ def expected(text: str, steps: list[int], k: int, lang: str, strip: bool) -> str
 
 
 def play(text: str, steps: list[int], lang: str = "python", strip: bool = False, human: bool = False,
-         name: str = "") -> bool:
+         name: str = "", nav: str = "home", before: list[str] | None = None,
+         after: list[str] | None = None) -> bool:
+    """Печать всех шагов. before/after — код, который уже был в файле выше/ниже места печати
+    (урок — продолжение файла); курсор ставится в начало пустой строки между ними."""
     s = settings(human)
     lines = S.analyze(text, steps, lang, strip)
     ed = Editor()
+    before, after = before or [], after or []
+    ed.lines = before + [""] + after
+    ed.r, ed.c = len(before), 0
     ok = True
     for k in S.step_numbers(steps, len(text.split("\n"))):
-        ed.run(S.build_step_units(lines, k, s))
-        exp = expected(text, steps, k, lang, strip)
+        ed.run(S.build_step_units(lines, k, s, nav))
+        exp = "\n".join(before + [expected(text, steps, k, lang, strip)] + after)
         if ed.text != exp:
             print(f"   [{name}] шаг {k}:\n   GOT {ed.text!r}\n   EXP {exp!r}")
             ok = False
@@ -205,7 +216,22 @@ def main() -> int:
         for strip in (False, True):
             if not play(text, st, strip=strip, name=f"random#{trial}/{strip}"):
                 bad += 1
-    check("400 случайных разметок × 2 режима", bad == 0, f"ошибок: {bad}")
+            # стрелками от курсора — и как продолжение файла: код выше и ниже не задевается
+            if not play(text, st, strip=strip, nav="arrows", name=f"random#{trial}/{strip}/arrows"):
+                bad += 1
+            if not play(text, st, strip=strip, nav="arrows", before=["import os", "", "x = 1"],
+                        after=["", "# конец файла"], name=f"random#{trial}/{strip}/continue"):
+                bad += 1
+    check("400 случайных разметок × 2 режима × 3 способа перехода", bad == 0, f"ошибок: {bad}")
+
+    # урок как продолжение уже написанного кода: стрелки не уходят в начало и конец файла
+    existing = ["# уже было в файле", "def hello():", "    print('привет')", ""]
+    check("урок — продолжение файла (стрелками)",
+          play(LESSON, LESSON_STEPS, strip=True, nav="arrows", before=existing, after=["", "hello()"],
+               name="continue"))
+    # вставка над первой строкой блока, когда она с отступом (Home дважды)
+    check("вставка над строкой с отступом",
+          play("    b = 2\n    c = 3", [2, 1], nav="arrows", before=["def f():"], name="indent-top"))
 
     # обычная печать не изменилась: построчный режим помечает ожидание только после непустых строк
     units = build_units("a\n\nb\nc", settings(), line_wait=True)

@@ -1,11 +1,17 @@
 """Защита набора от случайного вмешательства пользователя.
 
-Пока идёт печать, ставятся низкоуровневые хуки клавиатуры и мыши (WH_KEYBOARD_LL,
-WH_MOUSE_LL). Физическое нажатие клавиши или кнопки мыши → сигнал tripped,
-движок встаёт на паузу. Нажатая клавиша поглощается, чтобы не попасть в код.
-Свои синтетические события (флаг INJECTED) пропускаются. Хуки снимаются сразу
-после паузы/остановки — вне печати приложение клавиатуру не слушает.
+Пока идёт печать, ставится низкоуровневый хук клавиатуры (WH_KEYBOARD_LL). Физическое
+нажатие клавиши → сигнал tripped, движок встаёт на паузу. Нажатая клавиша поглощается,
+чтобы не попасть в код. Свои синтетические события (флаг INJECTED) пропускаются. Хук
+снимается сразу после паузы/остановки — вне печати приложение клавиатуру не слушает.
 Ничего не записывается: проверяется только факт нажатия.
+
+Клики мыши хуком не ловятся: хук мыши на Python пропускал бы через себя каждое движение
+курсора во всей системе (подтормаживание). Вместо него на время печати включается Raw Input
+(WM_INPUT): Windows лишь присылает копию событий мыши, ничего не ждёт от программы — курсор не
+тормозит. Каждое нажатие кнопки мыши не над окном самой программы увеличивает счётчик click_count;
+движок сверяет его перед каждым символом (typer._mouse_interrupt) — так ловится и короткий тап
+тачпада, который опрос «кнопка нажата сейчас» пропустил бы. Клики по окну программы — не вмешательство.
 
 Режим «ждём Enter» (печать по строкам): ставится только хук клавиатуры, физический Enter без
 модификаторов сообщается сигналом enter_pressed и НЕ поглощается — он доходит до редактора и
@@ -20,17 +26,16 @@ from ctypes import wintypes
 
 from PySide6.QtCore import QObject, Signal
 
+from . import winapi
+
 log = logging.getLogger(__name__)
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 WH_KEYBOARD_LL = 13
-WH_MOUSE_LL = 14
 WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
-WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN, WM_XBUTTONDOWN = 0x0201, 0x0204, 0x0207, 0x020B
 LLKHF_INJECTED = 0x10
-LLMHF_INJECTED = 0x01
 WM_QUIT = 0x0012
 WM_APP_ARM = 0x8000 + 10
 WM_APP_DISARM = 0x8000 + 11
@@ -51,11 +56,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
                 ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
 
 
-class MSLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
-
-
 user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
 user32.SetWindowsHookExW.restype = wintypes.HHOOK
 user32.CallNextHookEx.argtypes = (wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
@@ -70,9 +70,52 @@ user32.GetAsyncKeyState.restype = ctypes.c_short
 kernel32.GetModuleHandleW.argtypes = (wintypes.LPCWSTR,)
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
+# ---- Raw Input: нажатия кнопок мыши во время печати
+WM_INPUT = 0x00FF
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_REMOVE, RIDEV_INPUTSINK = 0x00000001, 0x00000100
+HWND_MESSAGE = -3
+# RI_MOUSE_LEFT/RIGHT/MIDDLE/BUTTON_4/BUTTON_5 _DOWN
+_BUTTONS_DOWN = 0x0001 | 0x0004 | 0x0010 | 0x0040 | 0x0100
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", wintypes.USHORT), ("usUsage", wintypes.USHORT), ("dwFlags", wintypes.DWORD),
+                ("hwndTarget", wintypes.HWND)]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", wintypes.DWORD), ("dwSize", wintypes.DWORD), ("hDevice", wintypes.HANDLE),
+                ("wParam", wintypes.WPARAM)]
+
+
+class RAWMOUSE(ctypes.Structure):
+    # после usFlags — объединение с ULONG ulButtons, оно выровнено на 4: usButtonFlags лежит по смещению 4
+    _fields_ = [("usFlags", wintypes.USHORT), ("_pad", wintypes.USHORT), ("usButtonFlags", wintypes.USHORT),
+                ("usButtonData", wintypes.USHORT), ("ulRawButtons", wintypes.ULONG), ("lLastX", wintypes.LONG),
+                ("lLastY", wintypes.LONG), ("ulExtraInformation", wintypes.ULONG)]
+
+
+class RAWINPUTMOUSE(ctypes.Structure):
+    _fields_ = [("header", RAWINPUTHEADER), ("mouse", RAWMOUSE)]
+
+
+user32.RegisterRawInputDevices.argtypes = (ctypes.POINTER(RAWINPUTDEVICE), wintypes.UINT, wintypes.UINT)
+user32.RegisterRawInputDevices.restype = wintypes.BOOL
+user32.GetRawInputData.argtypes = (wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT),
+                                   wintypes.UINT)
+user32.GetRawInputData.restype = wintypes.UINT
+user32.CreateWindowExW.argtypes = (wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_int,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                                   wintypes.HINSTANCE, wintypes.LPVOID)
+user32.CreateWindowExW.restype = wintypes.HWND
+user32.DestroyWindow.argtypes = (wintypes.HWND,)
+user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+
 
 class InputGuard(QObject):
-    tripped = Signal(str)   # "key" | "mouse"
+    tripped = Signal(str)   # "key"
     enter_pressed = Signal()
 
     def __init__(self) -> None:
@@ -83,12 +126,13 @@ class InputGuard(QObject):
         self._watching = False
         self._fired = False
         self._kb = None
-        self._ms = None
+        self._raw_hwnd = None      # окно-получатель Raw Input (только сообщения, на экране его нет)
+        self._raw_on = False
+        self._clicks = 0           # нажатия кнопок мыши не над окном программы, пока идёт печать
         self._thread_id = 0
         self._ready = threading.Event()
-        # ссылки на колбэки держим, иначе сборщик мусора их удалит → падение процесса
+        # ссылку на колбэк держим, иначе сборщик мусора его удалит → падение процесса
         self._kb_proc = HOOKPROC(self._on_key)
-        self._ms_proc = HOOKPROC(self._on_mouse)
         self._thread = threading.Thread(target=self._run, name="input-guard", daemon=True)
         self._thread.start()
         self._ready.wait(2)
@@ -112,13 +156,27 @@ class InputGuard(QObject):
         user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         self._thread.join(1)
 
+    def click_count(self) -> int:
+        """Сколько раз за время печати нажимали кнопку мыши не над окном программы (для движка)."""
+        return self._clicks
+
     # ------------------------------------------------------------ поток хуков
     def _run(self) -> None:
         msg = wintypes.MSG()
         user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, 0)
         self._thread_id = kernel32.GetCurrentThreadId()
+        # окно только для сообщений (HWND_MESSAGE): в него Windows присылает WM_INPUT
+        self._raw_hwnd = user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, HWND_MESSAGE, None,
+                                                kernel32.GetModuleHandleW(None), None)
+        if not self._raw_hwnd:
+            log.warning("Raw Input недоступен (ошибка %s) — клик мышью ловится только опросом",
+                        ctypes.get_last_error())
         self._ready.set()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+            if msg.message == WM_INPUT:
+                self._on_raw(msg.lParam)
+                user32.DispatchMessageW(ctypes.byref(msg))   # DefWindowProc освобождает данные WM_INPUT
+                continue
             if msg.message == WM_APP_ARM:
                 self._armed = True
                 self._fired = False
@@ -133,11 +191,39 @@ class InputGuard(QObject):
             self._sync_hooks()
         self._armed = self._watching = False
         self._sync_hooks()
+        if self._raw_hwnd:
+            user32.DestroyWindow(self._raw_hwnd)
+
+    def _sync_raw(self, on: bool) -> None:
+        """Raw Input мыши — только пока печатаем (в ожидании Enter и на паузе клики не нужны)."""
+        if on == self._raw_on or not self._raw_hwnd:
+            return
+        dev = RAWINPUTDEVICE(0x01, 0x02, RIDEV_INPUTSINK if on else RIDEV_REMOVE,
+                             self._raw_hwnd if on else None)   # Generic Desktop / Mouse
+        if user32.RegisterRawInputDevices(ctypes.byref(dev), 1, ctypes.sizeof(RAWINPUTDEVICE)):
+            self._raw_on = on
+        elif on:
+            log.warning("Raw Input мыши не включён: ошибка %s — клик ловится только опросом",
+                        ctypes.get_last_error())
+
+    def _on_raw(self, handle) -> None:
+        if not self._raw_on:
+            return
+        data = RAWINPUTMOUSE()
+        size = wintypes.UINT(ctypes.sizeof(data))
+        got = user32.GetRawInputData(handle, RID_INPUT, ctypes.byref(data), ctypes.byref(size),
+                                     ctypes.sizeof(RAWINPUTHEADER))
+        if got == 0xFFFFFFFF or got < ctypes.sizeof(RAWINPUTHEADER) or data.header.dwType != RIM_TYPEMOUSE:
+            return
+        if data.mouse.usButtonFlags & _BUTTONS_DOWN and not winapi.cursor_over_own_window():
+            self._clicks += 1
 
     def _sync_hooks(self) -> None:
-        """Хук клавиатуры — пока печатаем или ждём Enter; хук мыши — только пока печатаем."""
+        """Хук клавиатуры — пока печатаем или ждём Enter. Хука мыши нет (хук на Python тормозил бы курсор
+        во всей системе): пока печатаем, нажатия кнопок мыши приходят через Raw Input."""
+        self._sync_raw(self._armed)
         hmod = kernel32.GetModuleHandleW(None)
-        need_kb, need_ms = self._armed or self._watching, self._armed
+        need_kb = self._armed or self._watching
         if need_kb and not self._kb:
             self._kb = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._kb_proc, hmod, 0)
             if not self._kb:
@@ -145,13 +231,6 @@ class InputGuard(QObject):
         elif not need_kb and self._kb:
             user32.UnhookWindowsHookEx(self._kb)
             self._kb = None
-        if need_ms and not self._ms:
-            self._ms = user32.SetWindowsHookExW(WH_MOUSE_LL, self._ms_proc, hmod, 0)
-            if not self._ms:
-                log.warning("Не удалось поставить хук мыши: ошибка %s", ctypes.get_last_error())
-        elif not need_ms and self._ms:
-            user32.UnhookWindowsHookEx(self._ms)
-            self._ms = None
 
     def _current_mods(self) -> int:
         mods = 0
@@ -174,14 +253,4 @@ class InputGuard(QObject):
                     return 1  # поглотить: случайная клавиша не должна попасть в код
             elif not injected and k.vkCode == VK_RETURN and not self._current_mods():
                 self.enter_pressed.emit()   # не поглощаем: Enter должен дойти до редактора
-        return user32.CallNextHookEx(None, code, wparam, lparam)
-
-    def _on_mouse(self, code, wparam, lparam):
-        if code == 0 and self._armed and wparam in (WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN,
-                                                   WM_XBUTTONDOWN):
-            m = ctypes.cast(lparam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-            if not m.flags & LLMHF_INJECTED and not self._fired:
-                self._fired = True
-                self.tripped.emit("mouse")
-            # клик не поглощаем: пользователь, возможно, хочет переключить окно
         return user32.CallNextHookEx(None, code, wparam, lparam)

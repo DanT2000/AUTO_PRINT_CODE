@@ -380,8 +380,10 @@ class AudioRecorder(QObject):
             src.deleteLater()
             self.error.emit(OPEN_MSG)
             return False
-        src.stateChanged.connect(self._on_state)
+        # stateChanged не подключаем: PySide6 не умеет передать в Python его параметр (QAudio::State) —
+        # каждый вызов падал с TypeError. Ошибку микрофона проверяем в таймере (_pull → _check_source).
         self._source = src
+        self._source_failed = False
         self._attach(io, fmt, keep)
         return True
 
@@ -415,10 +417,6 @@ class AudioRecorder(QObject):
         self._buf = array("f")
         self._rest = b""
         if src is not None:
-            try:
-                src.stateChanged.disconnect(self._on_state)
-            except (RuntimeError, TypeError):
-                pass
             src.stop()
             src.deleteLater()
 
@@ -443,14 +441,17 @@ class AudioRecorder(QObject):
         if not self._warned and self._peak < 1e-5 and time.monotonic() - self._t0 > 1.5:
             self._warned = True
             self.error.emit(SILENT_MSG)
+        self._check_source()
 
-    def _on_state(self, state) -> None:
+    def _check_source(self) -> None:
+        """Микрофон сам остановился с ошибкой (отключили, занят) — сообщить один раз."""
         src = self._source
-        if src is None or state != QtAudio.State.StoppedState:
+        if src is None or self._source_failed or src.state() != QtAudio.State.StoppedState:
             return
         err = src.error()
         if err == QtAudio.Error.NoError:
             return
+        self._source_failed = True
         if err == QtAudio.Error.OpenError:
             msg = OPEN_MSG
         elif err == QtAudio.Error.IOError:

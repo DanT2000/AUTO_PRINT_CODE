@@ -1,10 +1,14 @@
 """Имитация ручного набора: живой ритм, паузы на обдумывание, опечатки с исправлением.
 
 Работает поверх готовых единиц печати (build_units) и только добавляет к ним:
-  * k     — множитель задержки после символа: знакомые слова и частые сочетания букв
-            быстрее, начало слова, Shift, цифры и знаки — медленнее, плюс медленный дрейф
-            темпа. Среднее k по тексту = 1, поэтому заданная скорость сохраняется;
-  * pause — пауза перед символом (обдумывание новой строки, заминка перед длинным именем);
+  * k     — множитель задержки после символа. Ритм «очередями», как у человека: слово
+            (и короткие связки вроде «()», «):», «, ») набирается быстро и ровно (k ≈ 0.55–0.8),
+            а весь разброс — в промежутках между словами: обычно короткий (k ≈ 1.3–2.5),
+            иногда заметная микропауза (k ≈ 3–6). Скрытое состояние «поток»/«осторожно»:
+            в потоке 2–5 слов идут почти без пауз, длинные и незнакомые имена чаще набираются
+            осторожно. Знакомые слова и частые сочетания букв быстрее, Shift и цифры медленнее,
+            плюс медленный дрейф темпа. Среднее k по тексту = 1 — заданная скорость сохраняется;
+  * pause — пауза перед символом (обдумывание новой строки, изредка долгая заминка перед словом);
   * опечатки — лишние «char»-единицы и «back» (Backspace). Их src_end равен длине уже
     верно набранного текста, поэтому шкала прогресса и пауза/продолжение работают как обычно.
 
@@ -169,111 +173,273 @@ def humanize(units: list["Unit"], settings: "Settings", rng: random.Random | Non
 
 
 # ------------------------------------------------------------------ ритм
+#
+# k — задержка ПОСЛЕ символа, то есть промежуток до следующего нажатия. Поэтому пауза перед
+# словом лежит на пробеле (знаке) перед ним, а темп внутри слова — на его буквах.
+# Числа ниже — до нормировки к среднему k = 1; на обычном тексте она умножает их примерно на 1.15.
+
+# темп внутри слова: «очередь» — быстро и ровно
+BURST_FAMILIAR, BURST_SHORT, BURST_LONG, BURST_XLONG = 0.56, 0.64, 0.7, 0.76
+BURST_CAREFUL = 1.1             # осторожный режим — очередь чуть медленнее
+FIRST_LETTER = (1.18, 1.32)     # после первой буквы слова пальцы ещё «разгоняются» (поток, осторожно)
+# промежуток перед словом — основной разброс ритма
+GAP_FLOW = (1.25, 1.9)          # в потоке: слово за словом
+GAP_CHUNK = (1.7, 2.6)          # конец очереди, но без заметной паузы
+GAP_CAREFUL = (1.8, 3.0)        # осторожно: длинные и незнакомые имена
+GAP_MICRO = (3.0, 5.5)          # заметная микропауза
+GAP_HESITATE = (1.3, 2.0)       # промежуток, за которым идёт долгая заминка (pause)
+GAP_OP = (1.0, 1.5)             # пробел перед оператором: « = », « -> », « * »
+GAP_TIGHT = (0.85, 1.3)         # self.name, 2.5 — точка почти не прерывает очередь
+INNER = 0.75                    # граница внутри токена — «(self», «[dict», «"price»: пауза короче
+HESITATE_S = (0.25, 0.9)        # долгая заминка, с (при think_pause_s = 1.5)
+# вероятности (подобраны так, что микропаузы ≈ 15 % промежутков, долгие заминки ≈ 4 %)
+P_CAREFUL, P_CAREFUL_HARD = 0.2, 0.5        # новая очередь — осторожно
+P_BREAK_HARD = 0.35             # длинное/незнакомое имя обрывает поток
+P_CHUNK_HES, P_CHUNK_MICRO = 0.08, 0.31    # на границе очередей: долгая заминка / микропауза
+P_CAREFUL_MICRO, P_FLOW_MICRO = 0.15, 0.03  # внутри очереди
+K_MIN, K_MAX = 0.32, 7.0       # пределы k после нормировки
+
+
+def _wc(c: str) -> bool:
+    return c.isalnum() or c == "_"
+
+
+def _hard(w: str) -> bool:
+    """Длинное или «неудобное» имя: такое человек набирает осторожнее и чаще перед ним задумывается."""
+    if not w or w in FAMILIAR:
+        return False
+    if len(w) >= 9:
+        return True
+    return len(w) >= 6 and (any(c.isupper() for c in w[1:]) or "_" in w.strip("_"))
+
+
+def _burst(w: str, careful: bool) -> float:
+    """Темп внутри слова: знакомые — на автомате, длинные — чуть медленнее."""
+    if w in FAMILIAR:
+        b = BURST_FAMILIAR
+    elif len(w) >= 12:
+        b = BURST_XLONG
+    elif len(w) >= 8:
+        b = BURST_LONG
+    else:
+        b = BURST_SHORT
+    return b * BURST_CAREFUL if careful else b
+
+
+class _Flow:
+    """Скрытое состояние ритма: «поток» (несколько слов подряд с короткими промежутками)
+    или «осторожно» (промежутки длиннее, первые буквы медленнее). Слова идут очередями:
+    слово, слово, слово — пауза — слово…"""
+
+    __slots__ = ("rng", "careful", "left")
+
+    def __init__(self, rng: random.Random) -> None:
+        self.rng = rng
+        self.careful = False
+        self.left = 0           # сколько слов ещё в текущей очереди
+
+    def start(self, hard: bool, line: bool) -> None:
+        """Новая очередь: режим и длина (в начале строки — короче, там уже была пауза на обдумывание)."""
+        rng = self.rng
+        self.careful = rng.random() < (P_CAREFUL_HARD if hard else P_CAREFUL)
+        if self.careful:
+            self.left = rng.randint(1, 2)
+        else:
+            self.left = rng.randint(1, 3) if line else rng.randint(2, 5)
+
+    def gap(self, word: str, sentence: bool) -> tuple[float, bool]:
+        """Промежуток перед очередным словом: (k, долгая заминка?)."""
+        rng = self.rng
+        hard = _hard(word)
+        if self.left > 0 and not sentence and not (hard and rng.random() < P_BREAK_HARD):
+            self.left -= 1      # продолжение очереди
+            if self.careful:
+                if rng.random() < P_CAREFUL_MICRO:
+                    return rng.uniform(*GAP_MICRO), False
+                return rng.uniform(*GAP_CAREFUL), False
+            if rng.random() < P_FLOW_MICRO:
+                return rng.uniform(*GAP_MICRO), False
+            return rng.uniform(*GAP_FLOW), False
+        # граница очередей: чаще всего заметная пауза
+        self.start(hard, False)
+        self.left -= 1
+        r = rng.random()
+        # перед знакомым словом («self», «return») долго не думают
+        p_hes = 0.0 if word in FAMILIAR else P_CHUNK_HES + (0.15 if sentence else 0.0) + (0.05 if hard else 0.0)
+        if r < p_hes:
+            return rng.uniform(*GAP_HESITATE), True
+        if r < p_hes + P_CHUNK_MICRO:
+            return rng.uniform(*GAP_MICRO), False
+        return rng.uniform(*GAP_CHUNK), False
+
 
 def _rhythm(units: list["Unit"], words, think: float, rng: random.Random) -> None:
-    """Проставляет k (темп) и pause (обдумывание) печатным символам."""
+    """Проставляет k (темп) и pause (обдумывание) печатным символам — построчно."""
     word_of = [-1] * len(units)
     for wi, (a, b, _, _) in enumerate(words):
         word_of[a:b] = [wi] * (b - a)
-
-    touched: list = []
-    line_start, prev_blank, line_has_text, first_line = True, True, False, True
-    prev_line_end = ""      # последний значимый символ предыдущей непустой строки
-    last_sig = ""           # последний непробельный символ текущей строки
-    prev = prev2 = ""
-    drift, phase = 0.0, rng.uniform(0, 2 * math.pi)
+    r = _Rhythm(units, words, word_of, think, rng)
+    line: list[int] = []        # печатаемые символы строки (без отступа)
+    prev_blank, first_line = True, True
+    prev_line_end = ""          # последний значимый символ предыдущей непустой строки
     for idx, u in enumerate(units):
         kind = u.kind
+        if kind == "char":
+            if line or not u.text.isspace():        # отступ — без изменений
+                line.append(idx)
+            continue
+        if kind in ("fast", "tab", "back", "cleanup"):
+            continue
+        if line:
+            r.line(line, first_line, prev_blank, prev_line_end)
         if kind == "newline":
-            prev_blank = not line_has_text
-            if line_has_text:
-                prev_line_end = last_sig
-            line_start, line_has_text, first_line = True, False, False
-            prev = prev2 = last_sig = ""
-            continue
-        if kind != "char":
-            if kind not in ("fast", "tab", "back", "cleanup"):
-                # переход в другое место (nav и т.п.) — как новый смысловой кусок
-                line_start, line_has_text, prev_blank = True, False, True
-                prev = prev2 = last_sig = ""
-            continue
-        ch = u.text
-        if line_start and ch.isspace():
-            continue            # отступ — без изменений
-        if len(ch) != 1:
-            prev2, prev = prev, " "     # таб посреди строки, развёрнутый в пробелы
-            continue
-        wi = word_of[idx]
-        w = words[wi][3] if wi >= 0 else ""
-        in_word = idx - words[wi][0] if wi >= 0 else -1
-        at_word_start = in_word == 0
-        familiar = w in FAMILIAR
-
-        # --- пауза перед символом
-        if think:
-            pause = 0.0
-            if line_start:
-                if first_line:
-                    pause = rng.uniform(0.1, 0.35) * think         # только начал — думать особо нечего
-                else:
-                    pause = rng.uniform(0.15, 0.45) * think
-                    if prev_blank:
-                        pause += rng.uniform(0.3, 0.7) * think     # новый смысловой кусок
-                    elif prev_line_end in OPENERS:
-                        pause += rng.uniform(0.0, 0.25) * think    # открыл блок — продумывает тело
-                if w in THINK_BEFORE:
-                    pause += rng.uniform(0.1, 0.4) * think
-                if ch in CLOSERS:
-                    pause *= 0.35                                   # закрывающая скобка — на автомате
-            elif at_word_start:
-                if len(w) >= 10 and not familiar and rng.random() < 0.18:
-                    pause = rng.uniform(0.25, 0.7) * think          # длинное имя: вспоминает, как пишется
-                elif prev == " " and last_sig in SENTENCE_END and ch.isupper() and rng.random() < 0.5:
-                    pause = rng.uniform(0.1, 0.35) * think          # новое предложение в обычном тексте
-                elif rng.random() < (0.01 if familiar else 0.04):
-                    pause = rng.uniform(0.1, 0.4) * think           # заминка посреди строки
-            if pause > u.pause:
-                u.pause = pause
-
-        # --- темп
-        k = 1.0
-        if familiar:
-            k *= 0.7
-        elif at_word_start:
-            k *= 1.3
-        elif in_word >= 2:
-            k *= 0.95                   # внутри слова пальцы разгоняются
-        if ch.isupper():
-            k *= 1.1 if prev.isupper() else 1.35        # Shift уже зажат — почти без задержки
-        elif ch in SHIFTED:
-            k *= 1.35
-        elif ch.isdigit():
-            k *= 1.0 if prev.isdigit() else 1.15
-        elif ch == " ":
-            k *= 0.85                   # пробел — большим пальцем, быстро
-        elif not ch.isalnum():
-            k *= 1.2
-        pair = prev + ch
-        if ch == prev:
-            k *= 0.8                    # повтор той же клавиши
-        elif pair in FAST_PAIRS or pair.lower() in BIGRAMS:
-            k *= 0.85                   # частое сочетание — «очередью»
-        if (prev2 + pair).lower() in TRIGRAMS:
-            k *= 0.92
-        # медленный дрейф темпа: случайное блуждание (сосредоточенность/усталость) + плавная волна
-        drift = max(-0.2, min(0.2, 0.98 * drift + rng.gauss(0, 0.016)))
-        k *= math.exp(drift) * (1 + 0.06 * math.sin(phase + idx / 60))
-        u.k = k
-        touched.append(u)
-        line_start, line_has_text = False, True
-        prev2, prev = prev, ch
-        if not ch.isspace():
-            last_sig = ch
-    if touched:
+            if line:
+                prev_line_end = next((units[i].text for i in reversed(line) if not units[i].text.isspace()), "")
+            prev_blank, first_line = not line, False
+        else:
+            prev_blank = True   # переход курсора (nav) и прочее — как новый смысловой кусок
+        line = []
+    if line:
+        r.line(line, first_line, prev_blank, prev_line_end)
+    if r.touched:
         # среднее k = 1: заданная скорость (симв/мин) сохраняется при любом тексте
-        mean = sum(u.k for u in touched) / len(touched)
-        for u in touched:
-            u.k /= mean
+        mean = sum(u.k for u in r.touched) / len(r.touched)
+        for u in r.touched:
+            u.k = min(K_MAX, max(K_MIN, u.k / mean))
+
+
+class _Rhythm:
+    def __init__(self, units, words, word_of, think: float, rng: random.Random) -> None:
+        self.units, self.words, self.word_of = units, words, word_of
+        self.think, self.rng = think, rng
+        self.flow = _Flow(rng)
+        self.touched: list = []
+        self.drift, self.phase = 0.0, rng.uniform(0, 2 * math.pi)
+
+    def _word(self, idx: int) -> str:
+        wi = self.word_of[idx]
+        return self.words[wi][3] if wi >= 0 else ""
+
+    def _line_pause(self, u, ch: str, w: str, first_line: bool, prev_blank: bool, prev_line_end: str) -> None:
+        """Обдумывание перед строкой."""
+        think, rng = self.think, self.rng
+        if not think:
+            return
+        if first_line:
+            pause = rng.uniform(0.1, 0.35) * think          # только начал — думать особо нечего
+        else:
+            pause = rng.uniform(0.15, 0.45) * think
+            if prev_blank:
+                pause += rng.uniform(0.3, 0.7) * think      # новый смысловой кусок
+            elif prev_line_end in OPENERS:
+                pause += rng.uniform(0.0, 0.25) * think     # открыл блок — продумывает тело
+        if w in THINK_BEFORE:
+            pause += rng.uniform(0.1, 0.4) * think
+        if ch in CLOSERS:
+            pause *= 0.35                                   # закрывающая скобка — на автомате
+        if pause > u.pause:
+            u.pause = pause
+
+    def _gap(self, u_next, word: str, sentence: bool, inner: bool) -> float:
+        """Промежуток перед словом (k) и, изредка, долгая заминка перед ним (pause у u_next)."""
+        k, hes = self.flow.gap(word, sentence)
+        if hes:
+            if self.think:
+                pause = self.rng.uniform(*HESITATE_S) * self.think / 1.5
+                if pause > u_next.pause:
+                    u_next.pause = pause
+            else:
+                k = self.rng.uniform(*GAP_MICRO)            # паузы выключены — хотя бы микропауза
+        return 1 + (k - 1) * INNER if inner else k
+
+    def line(self, idxs: list[int], first_line: bool, prev_blank: bool, prev_line_end: str) -> None:
+        units, rng, flow = self.units, self.rng, self.flow
+        # таб посреди строки (развёрнутый в пробелы) — как пробел
+        cs = [units[i].text if len(units[i].text) == 1 else " " for i in idxs]
+        n = len(cs)
+        # токены — отрезки без пробелов; есть ли в токене буквы/цифры (иначе это оператор: =, ->, ==)
+        has_word = [False] * n
+        a = 0
+        for j in range(n + 1):
+            if j == n or cs[j] == " ":
+                if a < j and any(_wc(c) for c in cs[a:j]):
+                    has_word[a:j] = [True] * (j - a)
+                a = j + 1
+
+        w0 = self._word(idxs[0]) if _wc(cs[0]) else ""
+        self._line_pause(units[idxs[0]], cs[0], w0, first_line, prev_blank, prev_line_end)
+        flow.start(_hard(w0), True)         # строку начинает новая очередь
+        flow.left -= 1
+        burst, pos = BURST_SHORT, 0
+        prefix = True           # от начала токена пока только знаки: «"», «(», «-» перед словом
+        last_sig = ""           # последний непробельный символ строки
+        for j in range(n):
+            idx = idxs[j]
+            c = cs[j]
+            nx = cs[j + 1] if j + 1 < n else ""
+            pv = cs[j - 1] if j else ""
+            if c == " ":
+                prefix = True
+            if _wc(c):
+                prefix = False
+                wi = self.word_of[idx]
+                pos = idx - self.words[wi][0] if wi >= 0 else pos + 1
+                if pos == 0:
+                    burst = _burst(self.words[wi][3] if wi >= 0 else "", flow.careful) * rng.uniform(0.93, 1.07)
+                k = burst
+                if _wc(nx):     # внутри слова
+                    if pos == 0:
+                        k *= FIRST_LETTER[flow.careful]
+                    if c == nx:
+                        k *= 0.85                   # повтор той же клавиши
+                    elif (c + nx).lower() in BIGRAMS:
+                        k *= 0.88                   # частое сочетание — «очередью»
+                    if (pv + c + nx).lower() in TRIGRAMS:
+                        k *= 0.94
+                elif nx and nx != " ":
+                    k *= 1.1                        # слово кончилось знаком
+                if c.isupper():
+                    k *= 1.1 if pv.isupper() else 1.4       # Shift уже зажат — почти без задержки
+                elif c.isdigit():
+                    k *= 1.0 if pv.isdigit() else 1.15
+                k *= rng.uniform(0.94, 1.06)
+            elif c == " " and nx and has_word[j + 1]:
+                # пробел перед словом (или перед «"слово», «(x», «-1») — главный промежуток
+                t = j + 1
+                while t < n and not _wc(cs[t]):
+                    t += 1
+                w = self._word(idxs[t]) if t < n else ""
+                sentence = last_sig in SENTENCE_END and t < n and cs[t].isupper()
+                k = self._gap(units[idxs[j + 1]], w, sentence, False)
+            elif _wc(nx) and c != " ":
+                if prefix:
+                    # «"» или «(» в начале токена: пауза уже была перед ним, дальше — очередью
+                    k = rng.uniform(0.8, 1.1) * (1.25 if c in SHIFTED else 1.0)
+                elif c == "." and _wc(pv):
+                    k = rng.uniform(*GAP_TIGHT)     # self.name, 2.5
+                    if _hard(self._word(idxs[j + 1])) and rng.random() < 0.2:
+                        k = rng.uniform(2.0, 3.2)   # длинный атрибут — вспоминает имя
+                else:
+                    k = self._gap(units[idxs[j + 1]], self._word(idxs[j + 1]), False, True)
+            elif c == " " and nx and nx != " ":
+                k = rng.uniform(*GAP_OP) * (1.2 if flow.careful else 1.0)
+            else:
+                # знаки подряд: «()», «):», «, », «"]» — тоже очередью, но чуть медленнее букв
+                k = 0.85
+                if c in SHIFTED:
+                    k *= 1.1 if pv in SHIFTED else 1.3      # Shift уже зажат — почти без задержки
+                elif c != " ":
+                    k *= 1.05
+                if c + nx in FAST_PAIRS or c == nx:
+                    k *= 0.85
+                k *= rng.uniform(0.92, 1.08)
+            if c != " ":
+                last_sig = c
+            # медленный дрейф темпа: случайное блуждание (сосредоточенность/усталость) + плавная волна
+            self.drift = max(-0.15, min(0.15, 0.98 * self.drift + rng.gauss(0, 0.012)))
+            u = units[idx]
+            u.k = k * math.exp(self.drift) * (1 + 0.05 * math.sin(self.phase + idx / 60))
+            self.touched.append(u)
 
 
 # ------------------------------------------------------------------ опечатки

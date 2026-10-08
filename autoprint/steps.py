@@ -4,10 +4,13 @@
 порядке; шаг k добавляет свои строки к уже напечатанным шагам 1…k−1 — в том числе выше и между ними
 («вернулись наверх и дописали импорт»). Менять уже напечатанные строки шаги не умеют, только добавлять.
 
-К месту вставки программа ведёт курсор сама: Ctrl+Home → ↓ × номер строки → End → Enter → строки шага
-(или с конца: Ctrl+End → ↑ …). Поэтому код блока должен начинаться с первой строки документа — новый
-файл, отдельная ячейка Jupyter, — а перенос длинных строк в редакторе должен быть выключен
-(иначе ↓ идёт по экранным строкам). Первый шаг печатается там, где стоит курсор.
+К месту вставки программа ведёт курсор сама. По умолчанию — стрелками от курсора: после шага он стоит
+в конце последней набранной строки, и следующий шаг поднимается/опускается ↑/↓ ровно на нужное число
+строк, затем End → Enter → строки шага. Так код блока может продолжать уже написанный в файле код —
+верх и низ файла не задеваются. Между шагами курсор в редакторе трогать нельзя. Второй способ —
+от начала документа (Ctrl+Home / Ctrl+End): переживает щелчки по редактору, но код блока должен
+начинаться с первой строки документа. Перенос длинных строк в редакторе должен быть выключен
+(иначе ↑/↓ идут по экранным строкам). Первый шаг печатается там, где стоит курсор.
 
 С «Без комментариев» строки-комментарии шага не печатаются: это текст для суфлёра — что сказать
 перед шагом. Их номер шага тоже важен: комментарий относится к тому шагу, где стоит.
@@ -18,7 +21,7 @@ from bisect import bisect_right
 from dataclasses import dataclass, field
 
 from .comments import comment_spans, comment_text, strip_comments
-from .storage import Settings
+from .storage import PROFILE_IDE, Settings
 from .typer import Unit, build_units
 
 
@@ -111,10 +114,28 @@ def _nav(name: str, src: int) -> Unit:
     return Unit("nav", name, src)
 
 
-def build_step_units(lines: list[SrcLine], k: int, settings: Settings) -> list[Unit]:
-    """Единицы печати шага k: переходы к местам вставки + строки. src_end — позиции в тексте блока."""
+def cursor_before(lines: list[SrcLine], k: int) -> int | None:
+    """Где курсор к началу шага k (строка документа с нуля): в конце последней строки предыдущего шага
+    с кодом — куски шага печатаются сверху вниз, значит, последней набрана самая нижняя его строка.
+    None — в документе ещё ничего нет."""
+    doc = [sl for sl in lines if sl.typed is not None and sl.step < k]
+    if not doc:
+        return None
+    prev = max(sl.step for sl in doc)
+    return max(i for i, sl in enumerate(doc) if sl.step == prev)
+
+
+def build_step_units(lines: list[SrcLine], k: int, settings: Settings, nav: str = "arrows") -> list[Unit]:
+    """Единицы печати шага k: переходы к местам вставки + строки. src_end — позиции в тексте блока.
+
+    nav="arrows" — от курсора стрелками (курсор после прошлого шага стоит в конце его последней строки):
+    код блока может быть продолжением уже написанного в файле, верх/низ файла не задеваются.
+    nav="home" — от начала документа (Ctrl+Home / Ctrl+End): надёжнее, если между шагами курсор трогают,
+    но код блока должен начинаться с первой строки документа."""
     units: list[Unit] = []
     present = present_before(lines, k)
+    cur = cursor_before(lines, k)
+    doc = [sl.typed for sl in lines if sl.typed is not None and sl.step < k]   # строки документа сейчас
     for ch in plan(lines, k):
         text = "\n".join(sl.typed for sl in ch.lines)
         cmap: list[int] = []
@@ -124,26 +145,54 @@ def build_step_units(lines: list[SrcLine], k: int, settings: Settings) -> list[U
             cmap.extend(sl.char_map)
         first_src = cmap[0] if cmap else ch.lines[0].start
         if present:   # в документе уже есть строки — идём к месту вставки
-            if ch.anchor == 0:
-                # в самый верх: новая пустая первая строка (Enter в начале документа, затем ↑)
-                units += [_nav("ctrl_home", first_src), _nav("enter_raw", first_src), _nav("up", first_src)]
+            if nav == "home":
+                units += _nav_home(ch.anchor, present, first_src)
             else:
-                target = ch.anchor - 1           # после этой строки (с нуля)
-                if target <= (present - 1) / 2:
-                    units.append(_nav("ctrl_home", first_src))
-                    units += [_nav("down", first_src) for _ in range(target)]
-                else:
-                    units.append(_nav("ctrl_end", first_src))
-                    units += [_nav("up", first_src) for _ in range(present - 1 - target)]
-                units.append(_nav("end", first_src))
+                units += _nav_arrows(ch.anchor, cur or 0, doc, first_src)
+            if ch.anchor:
                 units.append(Unit("newline", "\n", first_src))
         cu = build_units(text, settings, cleanup=True)
+        if not cu and units and units[-1].kind == "newline" and settings.profile == PROFILE_IDE:
+            # кусок — одна пустая строка: у build_units("") нет единиц, а значит и cleanup — автоотступ
+            # после Enter остался бы в строке (или следующий кусок принял бы его за свою пустую строку)
+            cu = [Unit("cleanup", "", first_src)]
         for u in cu:
             if cmap:
                 u.src_end = cmap[min(u.src_end, len(cmap)) - 1] + 1 if u.src_end > 0 else cmap[0]
         units += cu
         present += len(ch.lines)
+        doc[ch.anchor:ch.anchor] = [sl.typed for sl in ch.lines]
+        cur = ch.anchor + len(ch.lines) - 1      # курсор — в конце последней строки куска
     return units
+
+
+def _nav_home(anchor: int, present: int, src: int) -> list[Unit]:
+    """К месту вставки от начала документа."""
+    if anchor == 0:
+        # в самый верх: новая пустая первая строка (Enter в начале документа, затем ↑)
+        return [_nav("ctrl_home", src), _nav("enter_raw", src), _nav("up", src)]
+    target = anchor - 1                          # после этой строки (с нуля)
+    if target <= (present - 1) / 2:
+        out = [_nav("ctrl_home", src)] + [_nav("down", src) for _ in range(target)]
+    else:
+        out = [_nav("ctrl_end", src)] + [_nav("up", src) for _ in range(present - 1 - target)]
+    return out + [_nav("end", src)]
+
+
+def _nav_arrows(anchor: int, cur: int, doc: list[str], src: int) -> list[Unit]:
+    """К месту вставки стрелками от строки cur (курсор в её конце)."""
+    if anchor == 0:
+        # над первой строкой блока: в её начало, Enter — освободить строку, ↑ — на неё.
+        # «Умный» Home — переключатель (начало текста ⇄ столбец 0): сначала End, тогда Home идёт к началу
+        # текста, а у строки с отступом второй Home — в столбец 0
+        out = [_nav("up", src) for _ in range(cur)]
+        out += [_nav("end", src), _nav("home", src)]
+        if doc and doc[0].strip() and doc[0][:1] in (" ", "\t"):
+            out.append(_nav("home", src))
+        return out + [_nav("enter_raw", src), _nav("up", src)]
+    target = anchor - 1
+    step = "down" if target > cur else "up"
+    return [_nav(step, src) for _ in range(abs(target - cur))] + [_nav("end", src)]
 
 
 def narration(text: str, lines: list[SrcLine], k: int, lang: str) -> list[str]:
