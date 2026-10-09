@@ -27,7 +27,7 @@ from .frameless import FramelessWindow
 from .library import ROLE_COUNT, ROLE_ID, LibraryPanel
 from .prompter import Prompter
 from .settings_window import HOTKEYS, SettingsWindow
-from .template_view import TemplateView, ZoomWheelFilter
+from .template_view import TemplateView, ZoomWheelFilter, _plural
 from .theme import STATE_TOKENS, theme
 from .updates import MODE_AUTO, MODE_DOWNLOAD, UpdateDialog, UpdateManager
 from .widgets import IconButton, Toast
@@ -1332,7 +1332,8 @@ class MainWindow(FramelessWindow):
             if nxt is not None:
                 self._notify(f"Шаг {i} из {n} напечатан. Дальше — шаг {i + 1}.", quiet=True)
                 return
-            self._notify(f"Все {n} шаг(ов) напечатаны.", quiet=True)
+            self._notify("Шаг напечатан — он был единственным." if n == 1 else
+                         f"Все {n} {_plural(n, 'шаг', 'шага', 'шагов')} напечатаны.", quiet=True)
         else:
             self._notify("Набор завершён.", quiet=True)
         if self.settings.auto_advance and job:
