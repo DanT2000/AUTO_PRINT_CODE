@@ -98,7 +98,7 @@ class ControlStrip(QFrame):
         self.sw_human.setToolTip("Живой ритм, паузы на обдумывание и исправленные опечатки")
         self.sw_human.toggled.connect(self.human_toggled)
         self.sw_strip = Switch("Без комментариев")
-        self.sw_strip.setToolTip("Комментарии # …, // …, /* … */ не печатаются. Сам образец не меняется")
+        self.sw_strip.setToolTip("Комментарии # …, // …, /* … */ не печатаются. Само занятие не меняется")
         self.sw_strip.toggled.connect(self.strip_toggled)
         self.mode = Segmented(MODES)
         self.mode.setToolTip("Целиком — блок за один раз · По строкам — строка, затем Enter — следующая · "

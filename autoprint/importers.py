@@ -42,7 +42,10 @@ def _guess_lang(nb: dict) -> str:
 
 
 def import_ipynb(path: str) -> Template:
-    nb = json.loads(Path(path).read_text(encoding="utf-8"))
+    return notebook(json.loads(Path(path).read_text(encoding="utf-8")), Path(path).stem)
+
+
+def notebook(nb: dict, title: str) -> Template:
     if "cells" not in nb:
         raise ValueError("Это не тетрадка Jupyter (нет поля cells). Поддерживается формат nbformat 4.")
     lang = _guess_lang(nb)
@@ -53,14 +56,18 @@ def import_ipynb(path: str) -> Template:
             cells.append((kind, _cell_text(c), c.get("metadata", {}).get("autoprintcode", {})))
         elif kind == "raw":
             cells.append(("markdown", "```\n" + _cell_text(c) + "\n```"))
-    return _build(Path(path).stem, cells, lang)
+    return _build(title, cells, lang)
 
 
 _FENCE = re.compile(r"^```[ \t]*([\w+#.-]*)[^\n]*\n(.*?)^```[ \t]*$", re.M | re.S)
 
 
 def import_markdown(path: str) -> Template:
-    text = Path(path).read_text(encoding="utf-8").replace("\r\n", "\n")
+    return markdown_text(Path(path).read_text(encoding="utf-8").replace("\r\n", "\n"), Path(path).stem)
+
+
+def markdown_text(text: str, title: str) -> Template:
+    """Markdown: текст между ```-блоками — пояснения, сами блоки — код (язык по метке ```python)."""
     cells: list[tuple] = []
     pos = 0
     langs = []
@@ -70,7 +77,7 @@ def import_markdown(path: str) -> Template:
         langs.append(m.group(1).lower() or "text")
         pos = m.end()
     cells.append(("markdown", text[pos:].strip("\n")))
-    t = _build(Path(path).stem, cells, "python")
+    t = _build(title, cells, "python")
     # проставить язык каждому блоку кода по его ```-метке
     code_blocks = t.code_blocks()
     nonempty_langs = [lang for (kind, txt), lang in zip([c for c in cells if c[0] == "code"], langs) if txt.strip()]
@@ -94,11 +101,14 @@ def _uncomment(lines: list[str]) -> str:
 def import_python(path: str) -> Template:
     """Python-файл. Есть разметка ячеек «# %%» (VS Code, Spyder, Jupytext) — по ячейке на блок,
     «# %% [markdown]» — блок-пояснение без «# ». Иначе весь файл — один блок кода, как есть."""
-    text = Path(path).read_text(encoding="utf-8-sig").replace("\r\n", "\n")
+    return python_text(Path(path).read_text(encoding="utf-8-sig").replace("\r\n", "\n"), Path(path).stem)
+
+
+def python_text(text: str, title: str) -> Template:
     lines = text.split("\n")
     marks = [i for i, ln in enumerate(lines) if _PY_CELL.match(ln)]
     if not marks:
-        return _build(Path(path).stem, [("code", text.strip("\n"))], "python")
+        return _build(title, [("code", text.strip("\n"))], "python")
     cells: list[tuple] = [("code", "\n".join(lines[:marks[0]]).strip("\n"))]
     for n, i in enumerate(marks):
         body = lines[i + 1:marks[n + 1] if n + 1 < len(marks) else len(lines)]
@@ -106,9 +116,80 @@ def import_python(path: str) -> Template:
         if _PY_MD_TAG.search(header):
             cells.append(("markdown", _uncomment(body)))
         else:
-            title = header.strip()
-            cells.append(("code", "\n".join(body).strip("\n"), {"title": title} if title else {}))
-    return _build(Path(path).stem, cells, "python")
+            head = header.strip()
+            cells.append(("code", "\n".join(body).strip("\n"), {"title": head} if head else {}))
+    return _build(title, cells, "python")
+
+
+FILE_FILTER = ("Тетрадки и занятия (*.ipynb *.md *.py *.pyw *.json);;Jupyter (*.ipynb);;Markdown (*.md);;"
+               "Python (*.py *.pyw);;JSON (*.json)")
+FILE_EXTS = (".ipynb", ".md", ".py", ".pyw", ".json")
+
+
+def load_file(path: str) -> Template:
+    """Занятие из файла: .ipynb, .md, .py, .json (наш экспорт или ответ нейросети)."""
+    from .storage import TemplateStore
+    ext = Path(path).suffix.lower()
+    if ext == ".ipynb":
+        return import_ipynb(path)
+    if ext == ".md":
+        return import_markdown(path)
+    if ext in (".py", ".pyw"):
+        return import_python(path)
+    text = Path(path).read_text(encoding="utf-8-sig")
+    try:
+        return TemplateStore.read_template_file(path)
+    except (ValueError, KeyError, TypeError):
+        from .lesson_ai import parse_lesson
+        return parse_lesson(text, Path(path).stem).template
+
+
+# ---------------------------------------------------------------- «Вставить»: текст из буфера
+
+def guess_lang(code: str) -> str:
+    """Язык кода по виду — для вставленного без пояснений кода (ошибся — поправят в шапке блока)."""
+    s = code
+    if re.search(r"#include|std::|\bint main\s*\(", s):
+        return "cpp"
+    if re.search(r"public static void main|System\.out\.", s):
+        return "java"
+    if re.search(r"^\s*(SELECT|INSERT|UPDATE|DELETE|CREATE TABLE)\b", s, re.I | re.M):
+        return "sql"
+    if re.search(r"<(html|div|body|head|p|span)\b", s, re.I):
+        return "html"
+    if re.search(r"^\s*(def |class \w+.*:|import \w|from \S+ import |print\()", s, re.M):
+        return "python"
+    if re.search(r"\b(function|const|let|var)\b|=>|console\.log", s):
+        return "javascript"
+    if re.search(r"^\s*(using System|namespace \w)", s, re.M):
+        return "csharp"
+    return "python"
+
+
+def parse_pasted(text: str, lang: str = "") -> tuple[Template, str]:
+    """Вставленный текст → (занятие, что распознано). Понимает: ответ нейросети и наш .json, тетрадку
+    Jupyter (JSON), Markdown с ```-блоками, Python с ячейками «# %%», просто код (lang — язык; "" — угадать)."""
+    from .lesson_ai import extract_json, parse_lesson
+    from .storage import _fresh_ids, _template_from
+    src = text.replace("\r\n", "\n").strip("\n")
+    if not src.strip():
+        raise ValueError("Вставьте текст: код, Markdown или ответ нейросети.")
+    data = extract_json(src) if src.lstrip()[:1] in "{`" or "```json" in src else None
+    if isinstance(data, dict):
+        if isinstance(data.get("autoprintcode_template"), dict):
+            return _fresh_ids(_template_from(data["autoprintcode_template"])), "занятие AutoPrintCode (.json)"
+        if isinstance(data.get("cells"), list):
+            return notebook(data, "Тетрадка Jupyter"), "тетрадка Jupyter"
+        if isinstance(data.get("blocks"), list):
+            return parse_lesson(src).template, "занятие от нейросети"
+    if _FENCE.search(src):
+        t = markdown_text(src, "Вставленное занятие")
+        return t, "Markdown с блоками кода"
+    if any(_PY_CELL.match(ln) for ln in src.split("\n")):
+        return python_text(src, "Вставленный код"), "Python с ячейками # %%"
+    code_lang = lang or guess_lang(src)
+    t = _build("Вставленный код", [("code", src)], code_lang)
+    return t, f"код ({code_lang})"
 
 
 def export_ipynb(t: Template, path: str) -> None:

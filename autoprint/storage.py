@@ -111,6 +111,21 @@ class Settings:
     update_skip_version: str = ""      # «пропустить эту версию»
     update_last_check: float = 0.0
 
+    # нейросеть (⚙ → Нейросеть; autoprint/ai.py): разбор кода в занятие. Ключи — зашифрованы Windows (DPAPI)
+    ai_provider: str = ""              # "" — не подключена (остаётся «Скопировать промпт»)
+    ai_urls: dict = field(default_factory=dict)     # адрес сервера по провайдеру
+    ai_keys: dict = field(default_factory=dict)     # ключ по провайдеру: "dpapi:…" (base64)
+    ai_models: dict = field(default_factory=dict)   # модель по провайдеру
+    ai_backup_enabled: bool = False    # пробовать запасного, если основной не ответил
+    ai_backup_provider: str = ""
+    ai_timeout_s: int = 0              # 0 — по длине материала
+    # последний выбор в «Импорт → С помощью нейросети»
+    lesson_style: str = "steps"        # comments | steps | parts
+    lesson_task: bool = True
+    lesson_explain: bool = True
+    lesson_keep_code: bool = True
+    lesson_detail: str = "short"
+
     open_tabs: list = field(default_factory=list)
     current_tab: str = ""
     window_geometry: str = ""

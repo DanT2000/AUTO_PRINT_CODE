@@ -255,6 +255,7 @@ QFrame#hsep {{ background: {t['stroke']}; min-height: 1px; max-height: 1px; bord
          color: {t['dim']}; }}
 #pill[tone="accent"] {{ border-color: {t['accent']}; color: {t['accent']}; }}
 #pill[tone="ok"] {{ border-color: {t['ok']}; color: {t['ok']}; }}
+#pill[tone="warn"] {{ border-color: {t['live']}; color: {t['live']}; }}
 
 /* ---------- кнопки ---------- */
 QPushButton {{ background: {t['bg']}; border: 1px solid {t['stroke_strong']}; border-radius: 4px;

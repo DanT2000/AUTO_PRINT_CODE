@@ -18,6 +18,7 @@ from ..sounds import DEFAULT_STYLE, available_styles, delete_custom, is_custom, 
 from ..storage import PROFILES, Settings
 from ..updater import RELEASES_PAGE
 from . import logo
+from .ai_settings import build_page as build_ai_page
 from .frameless import FramelessWindow
 from .theme import THEMES, theme
 from .updates import INTERVALS, MODE_NOTIFY, UPDATE_MODES
@@ -30,7 +31,7 @@ HOTKEYS = [
     ("hotkey_stop", "Остановить", "stop"),
     ("hotkey_next_block", "Следующий блок кода", "arrow-down"),
     ("hotkey_prev_block", "Предыдущий блок кода", "arrow-up"),
-    ("hotkey_next_tab", "Следующий образец", "file-code"),
+    ("hotkey_next_tab", "Следующее занятие", "file-code"),
     ("hotkey_step_back", "Шаг назад без печати (режим «По шагам»)", "layers"),
 ]
 
@@ -41,6 +42,7 @@ PAGES = [
     ("hotkeys", "command", "Горячие клавиши"),
     ("behavior", "sliders", "Поведение"),
     ("look", "contrast", "Вид"),
+    ("ai", "sparkles", "Нейросеть"),
     ("updates", "refresh", "Обновления"),
     ("about", "info", "О программе"),
 ]
@@ -177,7 +179,8 @@ class SettingsWindow(FramelessWindow):
         self.nav: dict[str, NavButton] = {}
         builders = {"print": self._page_print, "human": self._page_human, "sound": self._page_sound,
                     "hotkeys": self._page_hotkeys, "behavior": self._page_behavior, "look": self._page_look,
-                    "updates": self._page_updates, "about": self._page_about}
+                    "ai": lambda: build_ai_page(self), "updates": self._page_updates,
+                    "about": self._page_about}
         for i, (key, ic, title) in enumerate(PAGES):
             if key == "updates":
                 sep = QWidget()
@@ -315,7 +318,7 @@ class SettingsWindow(FramelessWindow):
             "<b>Alt+1…9</b> (Alt+0 — новый шаг) или кнопка «Шаги» в шапке блока — там же разметка по "
             "комментариям одним щелчком. Хоткей старта печатает следующий шаг; программа сама ведёт курсор к "
             "месту вставки — как, задаёт строка «Шаги: к месту вставки» выше. Перенос длинных строк в редакторе "
-            "должен быть выключен. Пример — образец «Пример: пошаговый урок».",
+            "должен быть выключен. Пример — занятие «Пример: пошаговый урок».",
             "help"))
         lay.addWidget(group_title("Темп"))
         c = Card()
@@ -335,12 +338,12 @@ class SettingsWindow(FramelessWindow):
                   [self._switch("fast_indent")]))
         c.add(Row("indent", "Отступы клавишей Tab", "Одно нажатие на каждый уровень, как программист. "
                   "Не для простых полей в браузере: там Tab переводит фокус", [self._switch("indent_with_tab")]))
-        c.add(Row("space", "Таб в образце", "Сколько пробелов считать одним уровнем отступа",
+        c.add(Row("space", "Таб в коде", "Сколько пробелов считать одним уровнем отступа",
                   [self._spin("tab_width", 1, 8, " пробела")]))
         c.add(Row("select", "Выделение до целых строк", "Если выделить часть строки, напечатается вся строка",
                   [self._switch("selection_whole_lines")]))
         c.add(Row("comment-off", "Не печатать комментарии", "Строки-комментарии пропускаются, хвостовые "
-                  "отрезаются. Образец не меняется. То же — переключатель на пульте",
+                  "отрезаются. Само занятие не меняется. То же — переключатель на пульте",
                   [self._switch("strip_comments")]))
         lay.addWidget(c)
 
@@ -358,7 +361,7 @@ class SettingsWindow(FramelessWindow):
 
     def _page_human(self) -> QWidget:
         page, lay = self._page("Как человек", "Живой ритм, паузы на обдумывание и опечатки, которые тут же "
-                                              "исправляются. Итоговый текст всегда совпадает с образцом.")
+                                              "исправляются. Итоговый текст всегда совпадает с исходным кодом.")
         lay.addWidget(group_title("Имитация ручного ввода"))
         c = Card()
         sw = self._switch("human_typing")
@@ -385,7 +388,7 @@ class SettingsWindow(FramelessWindow):
             "задано на 100 символов: соседняя клавиша, переставленные буквы, двойное нажатие, пропущенная "
             "буква, промах с Shift, лишняя клавиша. Ошибку «замечают» через 0–3 буквы, стирают Backspace "
             "(иногда на букву больше) и набирают верно. Опечатки бывают только внутри слов — скобки, "
-            "кавычки, отступы и Enter не задеваются, итог всегда совпадает с образцом. Из-за пауз набор идёт "
+            "кавычки, отступы и Enter не задеваются, итог всегда совпадает с исходным кодом. Из-за пауз набор идёт "
             "медленнее заданной скорости."))
         self._finish(lay)
         return page
@@ -580,13 +583,13 @@ class SettingsWindow(FramelessWindow):
         c.add(Row("zoom", "Размер интерфейса", "Крупнее — всё окно целиком: текст, кнопки, значки. Применится "
                   "после перезапуска программы", [scale, restart]))
         c.add(Row("code", "Размер кода в блоке", "Ctrl или Shift + колёсико мыши над блоком — крупнее/мельче, "
-                  "Ctrl+0 — обычный размер, Ctrl+Shift+0 — все блоки образца", []))
+                  "Ctrl+0 — обычный размер, Ctrl+Shift+0 — все блоки занятия", []))
         lay.addWidget(c)
         self._finish(lay)
         return page
 
     def _page_updates(self) -> QWidget:
-        page, lay = self._page("Обновления", "Новые версии программы с GitHub. Образцы и настройки при "
+        page, lay = self._page("Обновления", "Новые версии программы с GitHub. Занятия и настройки при "
                                              "обновлении не меняются.")
         lay.addWidget(group_title("Проверка"))
         c = Card()
@@ -640,7 +643,7 @@ class SettingsWindow(FramelessWindow):
         self.refresh_update_info()
 
     def _page_about(self) -> QWidget:
-        page, lay = self._page(APP_NAME, "Агент для живых демонстраций кода: печатает заготовленный образец "
+        page, lay = self._page(APP_NAME, "Агент для живых демонстраций кода: печатает заготовленный код "
                                          "в любое окно без ошибок и в заданном темпе.")
         lay.addSpacing(18)
         head = QHBoxLayout()
@@ -653,7 +656,7 @@ class SettingsWindow(FramelessWindow):
         info.setSpacing(4)
         info.addStretch(1)
         info.addWidget(label(f"Версия {__version__}", "rowTitle"))
-        info.addWidget(label("Образцы и настройки хранятся в папке data рядом с программой.", "rowSub"))
+        info.addWidget(label("Занятия и настройки хранятся в папке data рядом с программой.", "rowSub"))
         info.addStretch(1)
         head.addLayout(info, 1)
         lay.addLayout(head)
@@ -687,7 +690,7 @@ class SettingsWindow(FramelessWindow):
     def _refresh_help(self) -> None:
         s = self.s
         self.help_note.text.setText(
-            "1. Слева выберите образец или нажмите <b>Импорт</b> (.ipynb, .md, .py, .json). Образец — лента "
+            "1. Слева выберите занятие или нажмите <b>Импорт</b> (.ipynb, .md, .py, .json). Занятие — лента "
             "блоков: условия, пояснения и код.<br>"
             "2. Щёлкните по блоку кода — он станет <b>активным</b> (янтарная рамка). Выделите строки, если "
             "нужно напечатать только их.<br>"

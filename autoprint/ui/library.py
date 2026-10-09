@@ -76,12 +76,12 @@ class LibraryPanel(QWidget):
 
         self.search = QLineEdit()
         self.search.setObjectName("search")
-        self.search.setPlaceholderText("Поиск образцов…")
+        self.search.setPlaceholderText("Поиск занятий…")
         self.search.setClearButtonEnabled(True)
         self._search_action = self.search.addAction(icons.icon("search"), QLineEdit.ActionPosition.LeadingPosition)
         lay.addWidget(self.search)
         lay.addSpacing(4)
-        lay.addWidget(label("Образцы", "navGroup"))
+        lay.addWidget(label("Занятия", "navGroup"))
 
         self.list = QListWidget()
         self.list.setObjectName("library")
@@ -104,7 +104,7 @@ class LibraryPanel(QWidget):
         row = QHBoxLayout()
         row.setSpacing(6)
         self.btn_new = accent_button("Новый", "plus")
-        self.btn_new.setToolTip("Новый образец (Ctrl+N)")
+        self.btn_new.setToolTip("Новое занятие (Ctrl+N)")
         self.btn_new.clicked.connect(self.new_requested)
         self.btn_import = button("Импорт", "import")
         self.btn_import.setToolTip("Импорт из .ipynb (Jupyter), .md, .py или .json (Ctrl+O)")

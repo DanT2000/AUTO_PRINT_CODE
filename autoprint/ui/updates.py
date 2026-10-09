@@ -241,15 +241,15 @@ class UpdateDialog(QDialog):
             if m.mode == MODE_FROZEN:
                 self.status.setText("Обновление скачано, контрольная сумма совпала. Программа закроется "
                                     "на несколько секунд и откроется уже новой версией. "
-                                    "Ваши образцы и настройки не изменятся.")
+                                    "Ваши занятия и настройки не изменятся.")
             else:
-                self.status.setText("Обновление скачано и проверено. Ваши образцы и настройки не изменятся.")
+                self.status.setText("Обновление скачано и проверено. Ваши занятия и настройки не изменятся.")
         elif m.downloading:
             self.btn_install.setText("Отменить загрузку")
             self.bar.show()
         else:
             self.btn_install.setText("Обновить и перезапустить")
-            self.status.setText("Ваши образцы и настройки не изменятся.")
+            self.status.setText("Ваши занятия и настройки не изменятся.")
 
     def _install(self) -> None:
         m = self.m

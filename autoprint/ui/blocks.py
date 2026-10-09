@@ -354,7 +354,7 @@ class CodeBlockWidget(BlockWidget):
         fl = QVBoxLayout(self.frame)
         fl.setContentsMargins(0, 2, 0, 0)
         self.editor = CodeEditor(block.text, block.lang)
-        self.editor.setPlaceholderText("Код образца. Выделите строки — будут напечатаны только они.")
+        self.editor.setPlaceholderText("Код занятия. Выделите строки — будут напечатаны только они.")
         self.editor.textChanged.connect(self._on_text)
         self.editor.selectionChanged.connect(self._on_selection)
         self.editor.focused.connect(lambda: self.arm_requested.emit(self))

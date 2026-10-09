@@ -15,7 +15,7 @@ from .. import steps as S
 from ..comments import comment_spans, comment_text, strip_comments
 from ..guard import InputGuard
 from ..hotkeys import HotkeyManager, parse_hotkey
-from ..importers import export_ipynb, import_ipynb, import_markdown, import_python
+from ..importers import export_ipynb
 from ..sounds import KeySoundPlayer
 from ..storage import Block, Settings, Template, TemplateStore, steps_sample_template
 from ..typer import COUNTDOWN, FINISHED, IDLE, LINE_WAIT, PAUSED, RUNNING, TypingEngine, build_units
@@ -171,7 +171,7 @@ class MainWindow(FramelessWindow):
         lib.customContextMenuRequested.connect(self._library_menu)
         self.library.search.textChanged.connect(self._filter_library)
         self.library.new_requested.connect(self.new_template)
-        self.library.import_requested.connect(self.import_files)
+        self.library.import_requested.connect(lambda: self.import_files())
         self.library.update_clicked.connect(self.open_update_dialog)
         root.addWidget(self.library)
 
@@ -204,7 +204,7 @@ class MainWindow(FramelessWindow):
         root.addWidget(main, 1)
         self.toast = Toast(main)
 
-        sc = [("Ctrl+N", self.new_template), ("Ctrl+O", self.import_files), ("Ctrl+Q", self.quit_app),
+        sc = [("Ctrl+N", self.new_template), ("Ctrl+O", lambda: self.import_files()), ("Ctrl+Q", self.quit_app),
               ("Ctrl+,", lambda: self.open_settings()), ("F1", lambda: self.open_settings("about")),
               ("Alt+Down", lambda: self.cmd_block(+1)), ("Alt+Up", lambda: self.cmd_block(-1)),
               ("Ctrl+=", lambda: self._zoom_block(+1)), ("Ctrl++", lambda: self._zoom_block(+1)),
@@ -226,10 +226,11 @@ class MainWindow(FramelessWindow):
         m.addAction(icons.icon("help"), "Как пользоваться\tF1", lambda: self.open_settings("about"))
         m.addAction(icons.icon("refresh"), "Проверить обновления…", lambda: self.check_updates(manual=True))
         m.addSeparator()
-        m.addAction(icons.icon("plus"), "Новый образец\tCtrl+N", self.new_template)
-        m.addAction(icons.icon("import"), "Импорт…\tCtrl+O", self.import_files)
-        m.addAction(icons.icon("export"), "Экспорт образца в .ipynb…", lambda: self.export_current("ipynb"))
-        m.addAction(icons.icon("export"), "Экспорт образца в .json…", lambda: self.export_current("json"))
+        m.addAction(icons.icon("plus"), "Новое занятие\tCtrl+N", self.new_template)
+        m.addAction(icons.icon("import"), "Импорт…\tCtrl+O", lambda: self.import_files())
+        m.addAction(icons.icon("sparkles"), "Разобрать код нейросетью…", lambda: self.import_files("ai"))
+        m.addAction(icons.icon("export"), "Экспорт занятия в .ipynb…", lambda: self.export_current("ipynb"))
+        m.addAction(icons.icon("export"), "Экспорт занятия в .json…", lambda: self.export_current("json"))
         m.addSeparator()
         m.addAction(icons.icon("file-code"), "Добавить пример занятия (все возможности)", self._add_tour_sample)
         m.addAction(icons.icon("file-code"), "Добавить пример пошагового урока", self._add_steps_sample)
@@ -440,7 +441,7 @@ class MainWindow(FramelessWindow):
         self._settings_touched()
         self._invalidate_job_if_idle()
         self._update_armed_label()
-        self._notify("Комментарии не печатаются." if on else "Комментарии печатаются как в образце.")
+        self._notify("Комментарии не печатаются." if on else "Комментарии печатаются как в коде.")
 
     def _on_human_toggle(self, on: bool) -> None:
         self.settings.human_typing = on
@@ -610,10 +611,10 @@ class MainWindow(FramelessWindow):
             self.open_template(visible[i].data(ROLE_ID))
 
     def new_template(self) -> None:
-        title, ok = QInputDialog.getText(self, "Новый образец", "Название (например, «Занятие 3. Циклы»):")
+        title, ok = QInputDialog.getText(self, "Новое занятие", "Название (например, «Занятие 3. Циклы»):")
         if not ok:
             return
-        t = self.store.add(title.strip() or "Новый образец")
+        t = self.store.add(title.strip() or "Новое занятие")
         self._touch()
         self._fill_library(t.id)
         self.open_template(t.id)
@@ -625,8 +626,8 @@ class MainWindow(FramelessWindow):
         self.open_template(c.id)
 
     def _delete_template(self, t: Template) -> None:
-        if QMessageBox.question(self, "Удалить образец",
-                                f"Удалить образец «{t.title}»?\n"
+        if QMessageBox.question(self, "Удалить занятие",
+                                f"Удалить занятие «{t.title}»?\n"
                                 "(Резервная копия прошлой версии базы — data/templates.json.bak)") \
                 != QMessageBox.StandardButton.Yes:
             return
@@ -640,37 +641,45 @@ class MainWindow(FramelessWindow):
             self.open_template(self.store.templates[0].id)
         self._update_armed_label()
 
-    def import_files(self) -> None:
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Импорт образцов", "",
-            "Тетрадки и образцы (*.ipynb *.md *.py *.pyw *.json);;Jupyter (*.ipynb);;Markdown (*.md);;"
-            "Python (*.py *.pyw);;JSON (*.json)")
+    def import_files(self, tab: str = "file") -> None:
+        """Окно «Импорт занятия»: из файла, вставкой или с помощью нейросети. Не модальное: из него можно
+        открыть ⚙ → Нейросеть, подключить её и вернуться."""
+        from .import_dialog import ImportDialog
+        d = getattr(self, "_import_dlg", None)
+        if d is not None and d.isVisible():
+            d.tabs.set_value(tab)
+            d._show_tab(tab)
+            d.raise_()
+            d.activateWindow()
+            return
+        d = ImportDialog(self, self.settings, tab=tab, open_ai_settings=lambda: self.open_settings("ai"))
+        d.accepted.connect(lambda: self._take_import(d))
+        d.finished.connect(lambda _r: self._save_settings())   # запомнить выбор разбора
+        self._import_dlg = d
+        d.show()
+
+    def _take_import(self, d) -> None:
+        from ..lesson_ai import STYLE_COMMENTS, STYLE_PARTS, STYLE_STEPS
         last = None
-        for p in paths:
-            ext = Path(p).suffix.lower()
-            try:
-                if ext == ".ipynb":
-                    t = import_ipynb(p)
-                elif ext == ".md":
-                    t = import_markdown(p)
-                elif ext in (".py", ".pyw"):
-                    t = import_python(p)
-                else:
-                    t = TemplateStore.read_template_file(p)
-            except Exception as e:
-                QMessageBox.warning(self, "Импорт", f"{Path(p).name}: {e}")
-                continue
-            if not t.blocks:
-                QMessageBox.information(self, "Импорт", f"{Path(p).name}: нет ячеек для импорта.")
-                continue
+        for t in d.result:
             self.store.insert(t)
             last = t
-            self._notify(f"Импортировано «{t.title}»: блоков — {len(t.blocks)}, "
-                         f"из них кода — {len(t.code_blocks())}.")
-        if last:
-            self._touch()
-            self._fill_library(last.id)
-            self.open_template(last.id)
+        if last is None:
+            return
+        self._touch()
+        self._fill_library(last.id)
+        self.open_template(last.id)
+        msg = (f"Добавлено занятие «{last.title}»: блоков — {len(last.blocks)}, из них кода — "
+               f"{len(last.code_blocks())}." if len(d.result) == 1 else f"Добавлено занятий: {len(d.result)}.")
+        mode = {STYLE_STEPS: MODE_STEPS, STYLE_COMMENTS: MODE_LINES, STYLE_PARTS: MODE_BLOCK}.get(d.result_style)
+        if mode:
+            # разбор нейросетью: включить подходящую печать; комментарии — на суфлёр, а не в редактор
+            self._on_mode(mode)
+            self.strip.sw_strip.setChecked(True)
+            names = {MODE_STEPS: "«По шагам»", MODE_LINES: "«По строкам»", MODE_BLOCK: "«Целиком»"}
+            msg += f" Включены {names[mode]} и «Без комментариев»" + \
+                   (": комментарии — на суфлёре." if mode != MODE_BLOCK else ": блок за блоком — Ctrl+F12.")
+        self.toast.show_message(msg, ms=9000)
 
     def export_current(self, fmt: str) -> None:
         v = self.current_view()
@@ -736,7 +745,7 @@ class MainWindow(FramelessWindow):
         try:
             self.store.save()
         except OSError as e:
-            self._notify(f"Не удалось сохранить образцы: {e}", warn=True)
+            self._notify(f"Не удалось сохранить занятия: {e}", warn=True)
 
     def _ensure_samples(self) -> str:
         """Встроенные примеры — по одному разу (и новым пользователям, и после обновления): пошаговый урок
@@ -1134,7 +1143,7 @@ class MainWindow(FramelessWindow):
             return
         if not self._same_job(job) or st == FINISHED or st == PAUSED:
             if st == PAUSED:
-                self._notify("Образец или выделение изменились — печать начнётся с начала.")
+                self._notify("Занятие или выделение изменились — печать начнётся с начала.")
             self._load_job(job)
         self.engine.start(*self._start_params(from_button, countdown))
 
@@ -1189,7 +1198,7 @@ class MainWindow(FramelessWindow):
         self.open_template(it.data(ROLE_ID))
         v = self.current_view()
         if v and not self.isActiveWindow():
-            self._notify(f"Образец: {v.template.title}", tray=True)
+            self._notify(f"Занятие: {v.template.title}", tray=True)
 
     def _on_hotkey(self, action: str) -> None:
         if action == "hotkey_toggle":

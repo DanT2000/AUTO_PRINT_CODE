@@ -48,7 +48,7 @@ CRASH_MARK = "Необработанное исключение"   # logs.setup_
 USER_PROFILE = "%USERPROFILE%"
 USER = "<user>"
 PC = "<pc>"
-HIDDEN_TEXT = "<текст образца скрыт>"
+HIDDEN_TEXT = "<текст занятия скрыт>"
 
 # что из настроек не нужно для разбора ошибки и описывает работу пользователя
 _DROP_SETTINGS = {"window_geometry", "splitter_state", "open_tabs", "current_tab"}
@@ -408,6 +408,8 @@ def _settings_snapshot(s: Settings) -> dict:
         d.pop(k, None)
     if str(d.get("sound_style", "")).startswith(_CUSTOM_SOUND):
         d["sound_style"] = _CUSTOM_SOUND + "… (свой звук)"
+    # ключи нейросети — только «задан», сами ключи в отчёт не попадают (даже зашифрованными)
+    d["ai_keys"] = {k: "задан" for k, v in (d.get("ai_keys") or {}).items() if v}
     last = d.get("update_last_check") or 0
     d["update_last_check"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(last)) if last else "—"
     return d
@@ -569,8 +571,8 @@ def to_markdown(report: dict) -> str:
     t = report.get("templates") or {}
     if t:
         langs = ", ".join(f"{k} {v}" for k, v in sorted(t.get("langs", {}).items(), key=lambda kv: -kv[1]))
-        out += ["", "## Образцы (только количество)", "",
-                f"- Образцов: {t.get('templates', 0)} · блоков: {t.get('blocks', 0)} "
+        out += ["", "## Занятия (только количество)", "",
+                f"- Занятий: {t.get('templates', 0)} · блоков: {t.get('blocks', 0)} "
                 f"(код: {t.get('code_blocks', 0)}, текст: {t.get('markdown_blocks', 0)})",
                 f"- Строк кода: {t.get('code_lines', 0)} · блоков с разметкой шагов: {t.get('step_blocks', 0)}"
                 + (f" · языки: {langs}" if langs else "")]
@@ -631,7 +633,7 @@ def _issue_body(report: dict, desc: str, crash: str, attachment: str) -> str:
         out += ["", f"### Последняя ошибка ({c['time']})", "", _fence(crash)]
     name = f"`{attachment}`" if attachment else "(кнопка «Сохранить отчёт…» в окне «Сообщить об ошибке»)"
     out += ["", "---", f"**Приложите файл отчёта** {name} — перетащите его в это поле. В нём сведения о системе "
-                       "и журнал работы, без текста образцов и личных данных."]
+                       "и журнал работы, без текста занятий и личных данных."]
     return "\n".join(out)
 
 

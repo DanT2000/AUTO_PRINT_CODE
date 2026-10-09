@@ -177,7 +177,25 @@ def main() -> int:
     for key in ("print", "human", "sound", "look"):
         sw.show_page(key)
         shot(sw, f"settings-{key}")
+    s.ai_provider = "claudeCli"   # нейросеть по подписке: без ключей и адресов в снимке
+    sw.ai_main.load()
+    sw.show_page("ai")
+    shot(sw, "settings-ai")
     sw.close()
+
+    # импорт с помощью нейросети: задание с решением и ответ — занятие по шагам
+    from autoprint import lesson_ai as L
+    win.import_files("ai")
+    imp = win._import_dlg
+    imp.resize(900, 940)
+    imp.material.setPlainText(
+        "Задача: посчитайте средний балл и медиану оценок ученика.\n\nРешение:\nimport statistics\n\n"
+        "grades = [5, 4, 3, 5]\naverage = sum(grades) / len(grades)\nmedian = statistics.median(grades)")
+    imp.answer_edit.setPlainText(L._EXAMPLES[L.STYLE_STEPS])
+    settle()
+    imp._parse_answer()
+    shot(imp, "import-ai")
+    imp.close()
 
     win._fill_logo_menu()
     win.logo_menu.adjustSize()

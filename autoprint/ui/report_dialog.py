@@ -32,7 +32,7 @@ BUG_ICON = ('<path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7
             '<path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/>')
 icons.PATHS.setdefault("bug", BUG_ICON)
 
-PLACEHOLDER = ("Например: открыл образец из Jupyter, в VS Code нажал Ctrl+F9 — ожидал, что код напечатается "
+PLACEHOLDER = ("Например: открыл занятие из Jupyter, в VS Code нажал Ctrl+F9 — ожидал, что код напечатается "
                "с отступами, а строки съехали вправо. Повторяется каждый раз.")
 HOW_TO_SEND = ("<b>Как отправить.</b> «Сохранить отчёт…» — получится файл .zip: отчёт и журнал целиком. "
                "«Открыть на GitHub» — в браузере откроется новое сообщение с кратким описанием: перетащите в него "
@@ -69,7 +69,7 @@ class ReportDialog(QDialog):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
         lay.addWidget(page_header("Сообщить об ошибке", "Опишите, что произошло. К сообщению приложатся версия "
-                                  "программы, сведения о системе и журнал работы — без текста образцов и того, "
+                                  "программы, сведения о системе и журнал работы — без текста занятий и того, "
                                   "что печатается."))
         lay.addSpacing(16)
 
@@ -84,7 +84,7 @@ class ReportDialog(QDialog):
                   [self.desc], stack=True))
         self.with_settings = Switch(checked=True)
         self.with_settings.toggled.connect(self._recollect)
-        c.add(Row("sliders", "Приложить настройки (без образцов и личных данных)",
+        c.add(Row("sliders", "Приложить настройки (без занятий и личных данных)",
                   "Скорость, режимы, горячие клавиши, экраны и названия звуковых устройств", [self.with_settings]))
         crash = report.last_crash(self.report)
         if crash:
