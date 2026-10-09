@@ -137,6 +137,8 @@ class TypingEngine(QObject):
         self._last_ident = False       # последней была буква/цифра — могла открыться подсказка
         self._indent_pending = False   # после Enter — автоотступ редактора ещё не заменён
         self._in_word = self._word_alpha = False   # идёт слово; начато с буквы (у чисел подсказок нет)
+        self._typed_on_line = False    # в этой строке уже что-то набрали (после Enter или перехода к месту вставки)
+        self._line_text = False        # …и не только отступ
         self.job_key = None    # чем занят движок (id блока) — для UI
         # счётчик нажатий кнопок мыши не над окном программы (guard.InputGuard.click_count, Raw Input):
         # ловит и короткий тап тачпада между опросами кнопок. Клики до старта/продолжения не считаются
@@ -369,7 +371,8 @@ class TypingEngine(QObject):
             self._wset(gen, PAUSED)
 
     def _worker(self, gen: int, delay: float, countdown: int) -> None:
-        self._dirty = self._last_ident = self._indent_pending = self._in_word = False
+        self._dirty = self._last_ident = self._indent_pending = self._in_word = self._typed_on_line = False
+        self._line_text = False
         target = self._prepare(gen, delay, countdown)
         if target is None:
             if self._wset(gen, PAUSED if self._pos else IDLE):
@@ -484,6 +487,8 @@ class TypingEngine(QObject):
         ide = s.profile == PROFILE_IDE
         if ide and self._indent_pending and u.kind not in ("newline", "cleanup", "nav"):
             self._start_line_text(u)
+        if u.kind in ("char", "fast", "tab", "back"):
+            self._typed_on_line = True
         if u.kind == "char":
             if ide and u.text in CLEAR_BEFORE:
                 # не полагаемся на «перепечатывание» автоскобок — оно у редакторов разное
@@ -491,6 +496,11 @@ class TypingEngine(QObject):
                 # Но только когда справа может что-то быть — лишние нажатия видны как дёрганье.
                 if self._last_ident:
                     self._clear_right()      # могла открыться подсказка автодополнения — закрыть
+                elif u.text in CLOSE_BRACKETS and not self._line_text:
+                    # закрывающая скобка — первая в строке (после отступа): без «пробел + стереть» перед ней
+                    # VS Code переставляет отступ строки по своим правилам (уровень 4 пробела) — «  }» из
+                    # образца с отступом в 2 пробела становилась «}» (проверено на настоящем VS Code)
+                    self._clear_right()
                 elif self._dirty:
                     if u.text in CLOSE_BRACKETS:
                         w.tap(w.VK_END, w.VK_SHIFT)   # выделить дописанное — скобка его заменит
@@ -500,6 +510,8 @@ class TypingEngine(QObject):
                 self._dirty = False
             w.type_char(u.text) if len(u.text) == 1 else self._fast(u.text, gen)
             self.sound.emit("space" if u.text == " " else "key")
+            if u.text.strip():
+                self._line_text = True
             if ide:
                 ch = u.text[-1:]
                 if ch in OPENERS:
@@ -527,6 +539,7 @@ class TypingEngine(QObject):
                 self._clear_indent()   # кусок из одной пустой строки: автоотступ не оставлять в ней
             vk, mods = NAV_KEYS[u.text]
             w.tap(vk, *mods)
+            self._typed_on_line = self._line_text = False
         elif u.kind == "newline":
             if not enter_done:   # печать по строкам: Enter пользователь уже нажал сам
                 if ide:
@@ -539,14 +552,17 @@ class TypingEngine(QObject):
                         time.sleep(self._gap())
                     elif self._last_ident:
                         self._clear_right()   # закрыть подсказку: иначе Enter её примет; заодно хвост
-                    else:
+                    elif self._typed_on_line:
                         # что редактор дописал справа (скобки, кавычки, закрывающий тег после «>», « */»
-                        # после «/**») — выделить, Enter заменит. Если справа пусто, нажатие ничего не меняет
+                        # после «/**») — выделить, Enter заменит. Если справа пусто, нажатие ничего не меняет.
+                        # Только если в строке что-то набрали: сразу после перехода к месту вставки (↑/↓, End)
+                        # Блокнот Windows 11 выделил бы Shift+End ещё и перенос строки — Enter заменил бы его,
+                        # и следующая строка документа пропала бы под набранным текстом
                         w.tap(w.VK_END, w.VK_SHIFT)
                         time.sleep(self._gap())
                 w.tap(w.VK_RETURN)
                 self.sound.emit("enter")
-            self._dirty = self._last_ident = self._in_word = False
+            self._dirty = self._last_ident = self._in_word = self._typed_on_line = self._line_text = False
             if ide:
                 time.sleep(self._gap() * 2)  # дать редактору вставить автоотступ
                 self._indent_pending = True   # уберём его перед первым символом новой строки

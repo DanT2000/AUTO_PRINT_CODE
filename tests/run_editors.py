@@ -128,7 +128,10 @@ if "notepad" in which:
     run("Блокнот/plain", ["notepad.exe"], "np_plain.txt", PY, "plain", close_keys=lambda: w.tap(ord("W"), w.VK_CONTROL))
     time.sleep(1)
     run("Блокнот/ide", ["notepad.exe"], "np_ide.txt", PY, "ide", close_keys=lambda: w.tap(ord("W"), w.VK_CONTROL))
-code_cmd = [r"C:\Users\ADMIN\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+# AP_VSCODE — другой Code.exe (например, портативный): установленный VS Code с ожидающим обновлением
+# новых окон не открывает, пока не закрыть все его окна
+code_cmd = [os.environ.get("AP_VSCODE") or os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                                                       "Microsoft VS Code", "Code.exe"),
             f"--user-data-dir={SP}/vscode-data", f"--extensions-dir={SP}/vscode-ext", "--disable-extensions",
             "--skip-welcome", "--skip-release-notes", "--disable-workspace-trust", "-n"]
 if "vscode" in which:

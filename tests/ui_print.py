@@ -217,7 +217,9 @@ def run_lines(win: MainWindow, name: str, profile: str) -> bool:
     return ok and waits == nonblank
 
 
-VSCODE = Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe"
+# AP_VSCODE — другой Code.exe (например, портативный), см. run_editors.py
+VSCODE = Path(os.environ.get("AP_VSCODE") or
+              Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Microsoft VS Code" / "Code.exe")
 
 
 def main() -> int:

@@ -44,6 +44,7 @@ from autoprint.comments import comment_spans  # noqa: E402
 from autoprint.storage import (BLOCK_CODE, PROFILE_IDE, PROFILE_PLAIN, Block, Settings, Template,  # noqa: E402
                                TemplateStore)
 from autoprint.typer import FINISHED, IDLE, LINE_WAIT, RUNNING, TypingEngine, build_units  # noqa: E402
+from autoprint.storage import STEPS_SAMPLE_CODE as S_CODE, STEPS_SAMPLE_STEPS as S_STEPS  # noqa: E402
 
 failed: list[str] = []
 
@@ -67,9 +68,15 @@ class Editor:
     def __init__(self) -> None:
         self.reset()
 
-    def reset(self, ide: bool = False, tags: bool = False) -> None:
+    def reset(self, ide: bool = False, tags: bool = False, richedit: bool = False) -> None:
         self.lines, self.r, self.c, self.sel, self.ide = [""], 0, 0, None, ide
         self.tags = tags                  # как HTML в VS Code: после «<div>» справа появляется «</div>»
+        # как Блокнот Windows 11 (RichEdit): курсор пришёл ↑/↓ с более длинной строки — Shift+End выделяет и
+        # перенос строки; набранная буква его не трогает, а Enter заменяет (новой строки не получается)
+        self.richedit = richedit
+        self.want = 0                     # «желаемый» столбец при ↑/↓
+        self.overshoot = False            # строка короче желаемого столбца
+        self.sel_eol = False              # в выделение попал перенос строки
         self.held: set[int] = set()
         self.bad: list[str] = []          # нажатия с зажатым Ctrl — так печать идти не должна
         self.lock = threading.Lock()
@@ -97,6 +104,7 @@ class Editor:
                 closer = f"</{m.group(1)}>"
             self.lines[self.r] = ln[:self.c] + ch + closer + ln[self.c:]
             self.c += 1
+            self.want, self.overshoot, self.sel_eol = self.c, False, False
 
     def tap(self, vk: int, *mods: int) -> None:
         with self.lock:
@@ -104,6 +112,22 @@ class Editor:
             name, shift, ctrl = KEYS[vk], W.VK_SHIFT in mods, W.VK_CONTROL in mods
             if W.VK_CONTROL in self.held:
                 self.bad.append(f"Ctrl+{name}")
+            eol = self.sel_eol
+            self.sel_eol = False
+            if self.richedit and name == "end" and shift and not ctrl and self.overshoot \
+                    and self.r < len(self.lines) - 1:
+                self.sel_eol = True       # особенность RichEdit — см. reset()
+            if name == "enter" and eol:
+                self.sel = None
+                self.r, self.c = self.r + 1, 0   # перенос заменён переносом: курсор — в начале следующей строки
+                self.want, self.overshoot = 0, False
+                return
+            if name in ("up", "down"):
+                self.sel = None
+                self.r = max(0, self.r - 1) if name == "up" else min(len(self.lines) - 1, self.r + 1)
+                self.c = min(self.want, len(self.lines[self.r]))
+                self.overshoot = self.want > len(self.lines[self.r])
+                return
             if name in ("home", "end") and ctrl:
                 self.sel = None
                 self.r = 0 if name == "home" else len(self.lines) - 1
@@ -111,10 +135,7 @@ class Editor:
             elif name in ("home", "end"):
                 self.sel = (self.c if self.sel is None else self.sel) if shift else None
                 self.c = 0 if name == "home" else len(self.lines[self.r])
-            elif name in ("up", "down"):
-                self.sel = None
-                self.r = max(0, self.r - 1) if name == "up" else min(len(self.lines) - 1, self.r + 1)
-                self.c = min(self.c, len(self.lines[self.r]))
+                # End после ↑/↓ особенность Блокнота не снимает (проверено на настоящем Блокноте)
             elif name == "back":
                 if self.sel is not None and self.sel != self.c:
                     self._del_sel()
@@ -141,6 +162,8 @@ class Editor:
                 ln = self.lines[self.r]
                 self.lines[self.r] = ln[:self.c] + "    " + ln[self.c:]
                 self.c += 4
+            if name in ("back", "enter", "tab"):
+                self.want, self.overshoot = self.c, False
 
 
 ED = Editor()
@@ -323,6 +346,48 @@ def steps_blank_chunk() -> None:
         run_units(S.build_step_units(lines, k, s, "arrows"), s)
     check("по шагам: пустая строка в конце шага — без хвоста пробелов", ED.text == "def g():\n    x = 1\n",
           repr(ED.text))
+
+
+def notepad_steps() -> None:
+    """Пошаговый урок, профиль IDE, но окно — Блокнот Windows 11: курсор к месту вставки идёт ↑ с более
+    длинной строки, и Shift+End перед Enter выделил бы перенос — следующая строка урока пропадала."""
+    lines = S.analyze(S_CODE, S_STEPS, "python", True)
+    exp = "\n".join(sl.typed for sl in lines if sl.typed is not None)
+    s = Settings()
+    s.profile, s.human_typing = PROFILE_IDE, False
+    ED.reset(ide=False, richedit=True)
+    for k in sorted(set(S_STEPS)):
+        run_units(S.build_step_units(lines, k, s, "arrows"), s)
+    check("по шагам в Блокноте (IDE): вставка в середину не съедает следующую строку", ED.text == exp,
+          f"\n  есть {ED.text!r}\n  ждём {exp!r}")
+
+
+def bracket_first_on_line() -> None:
+    """Профиль IDE: перед закрывающей скобкой, которая первая в строке (после отступа), — «Shift+End, пробел,
+    стереть». Без них настоящий VS Code сам переставлял отступ такой строки: «  }» → «}» (образец с отступом 2)."""
+    code = "function sum(arr) {\n  for (const n of arr) {\n    if (n) {\n      t += n;\n    }\n  }\n}"
+    ED.reset(ide=True)
+    log: list[str] = []
+    orig_char, orig_tap = W.type_char, W.tap
+
+    def char(ch: str) -> None:
+        log.append(f"char:{ch}")
+        orig_char(ch)
+
+    def tap(vk: int, *mods: int) -> None:
+        log.append(("shift+" if W.VK_SHIFT in mods else "") + KEYS[vk])
+        orig_tap(vk, *mods)
+    W.type_char, W.tap = char, tap
+    try:
+        s = Settings()
+        s.profile, s.human_typing = PROFILE_IDE, False
+        run_units(build_units(code, s), s)
+    finally:
+        W.type_char, W.tap = orig_char, orig_tap
+    before = [log[i - 3:i] for i, x in enumerate(log) if x == "char:}"]
+    ok = len(before) == 3 and all(b == ["shift+end", "char: ", "back"] for b in before)
+    check("закрывающая скобка первой в строке — перед ней «Shift+End, пробел, стереть»", ok and ED.text == code,
+          f"{before} {ED.text!r}" if not ok or ED.text != code else "")
 
 
 def closing_tag_tail() -> None:
@@ -602,6 +667,8 @@ def main() -> int:
     mouse_click_pauses()
     tray_click_keeps_pause()
     steps_blank_chunk()
+    notepad_steps()
+    bracket_first_on_line()
     closing_tag_tail()
     for profile in (PROFILE_PLAIN, PROFILE_IDE):
         for strip in (False, True):
