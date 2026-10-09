@@ -512,6 +512,83 @@ def prompter_lines() -> None:
     pump()
 
 
+def prompter_window() -> None:
+    """Суфлёр в отдельном окне: «Дальше» печатает шаг за шагом и сам переходит к следующему блоку,
+    «Назад» — к прошлому шагу; «Печатаю сам» — листает шаги и ничего не печатает (и хоткеем тоже)."""
+    from autoprint.storage import BLOCK_MARKDOWN
+    from autoprint.ui.prompter_control import chunk_view
+    ED.reset()
+    win, s, store = make_window(PROFILE_PLAIN)
+    b1 = Block(BLOCK_CODE, "# Заводим x\nx = 1\n# Удвоим\ny = x * 2", steps=[1, 1, 2, 2])
+    b2 = Block(BLOCK_CODE, "# Выводим\nprint(y)\n\n# И ещё раз\nprint(x)")
+    t = Template("суфлёр-окно", [Block(BLOCK_MARKDOWN, "## Задача\nУдвоить **x**.", role="task"), b1, b2])
+    store.insert(t)
+    win._fill_library(t.id)
+    win.open_template(t.id)
+    win.views[t.id].go_to_block(b1.id)
+    win.strip.sw_strip.setChecked(True)
+    win._on_mode("steps")
+    ctl = win.prompter_ctl
+    ctl.show()
+    pump(0.2)
+    w = ctl.window
+    card = ctl.card()
+    check("окно суфлёра открыто, суфлёр под пультом спрятан", ctl.visible() and not win.prompter.isVisible()
+          and s.prompter_window and win.strip.btn_prompter.isChecked())
+    check("окно: шаг 1 из 2, условие задачи и что сказать, код шага",
+          card.title == "шаг 1 из 2" and card.say == ["Задача\nУдвоить x.", "Заводим x"]
+          and card.chunks == [("", ["x = 1"])] and w.btn_next.text().strip() == "Напечатать", repr(card))
+    ctl.next()
+    ok = wait_for(lambda: win.engine.state == FINISHED and win.job is None)
+    pump(0.1)
+    check("«Дальше» печатает шаг 1, окно показывает шаг 2", ok and ED.text == "x = 1"
+          and ctl.card().title == "шаг 2 из 2" and ctl.card().say == ["Удвоим"], repr(ED.text))
+    ctl.next()
+    wait_for(lambda: win.engine.state == FINISHED and win.job is None)
+    moved = wait_for(lambda: win._armed()[1].id == b2.id, 3)
+    pump(0.1)
+    check("блок допечатан — суфлёр сам перешёл к следующему блоку", moved and ED.text == "x = 1\ny = x * 2"
+          and ctl.card().sub.endswith("блок 2 из 2"), ctl.card().sub)
+    ctl.back()
+    pump(0.1)
+    check("«Назад» на первом шаге блока — к последнему шагу прошлого блока",
+          win._armed()[1].id == b1.id and win._step_pointer(b1.id) == 2, str(win._step_pointer(b1.id)))
+    # «Печатаю сам»: хоткей и «Дальше» листают шаги, программа не печатает
+    ED.reset()
+    w.mode_changed.emit("self")
+    win.views[t.id].go_to_block(b2.id)
+    pump(0.1)
+    c = ctl.card()
+    check("«печатаю сам»: блок без разметки — шаги по комментариям",
+          c.title.startswith("шаг 1 из 2") and c.say == ["Выводим"] and c.chunks == [("", ["print(y)"])], repr(c))
+    win._on_hotkey("hotkey_toggle")
+    pump(0.1)
+    c = ctl.card()
+    check("«печатаю сам»: хоткей старта — следующий шаг, в редактор ничего не напечатано",
+          c.title.startswith("шаг 2 из 2") and c.say == ["И ещё раз"] and ED.text == ""
+          and win.engine.state in (IDLE, FINISHED) and win.job is None,
+          repr((c.title, ED.text, win.engine.state)))
+    win._on_hotkey("hotkey_step_back")
+    pump(0.1)
+    check("«печатаю сам»: «шаг назад» — предыдущий шаг", ctl.card().title.startswith("шаг 1 из 2"))
+    ctl.back()
+    pump(0.1)
+    check("«печатаю сам»: «Назад» с первого шага — последний шаг прошлого блока",
+          win._armed()[1].id == b1.id and ctl.card().title.startswith("шаг 2 из 2"), ctl.card().title)
+    # куда вставлять кусок шага, если он не в конце
+    lines = S.analyze("import math\n\nx = 1\ny = math.sqrt(x)", [2, 2, 1, 2], "python", True)
+    chunks, hidden = chunk_view(lines, 2)
+    check("куски шага: import — «в самое начало», остальное — «в конец»",
+          [wh.split(" —")[0] for wh, _ in chunks] == ["↑ в самое начало", "↓ в конец"] and not hidden, repr(chunks))
+    w.mode_changed.emit("auto")
+    w.close()
+    pump(0.1)
+    check("окно закрыли — снова суфлёр под пультом", not ctl.visible() and not s.prompter_window
+          and win.prompter.isVisible() and not win.strip.btn_prompter.isChecked())
+    win.close()
+    pump()
+
+
 def comments_speed() -> None:
     rows = []
     for i in range(500):
@@ -678,6 +755,7 @@ def main() -> int:
     lines_block(PROFILE_IDE, True, hotkey_with_ctrl=True)
     races()
     prompter_lines()
+    prompter_window()
     comments_speed()
     check("без исключений", not errors, errors[0].splitlines()[-1] if errors else "")
     print("ГОТОВО" if not failed else f"ОШИБКИ: {failed}")

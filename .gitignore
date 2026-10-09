@@ -46,3 +46,6 @@ desktop.ini
 # --- Сборка exe: спецификация PyInstaller от ручного запуска, вывод Inno Setup по умолчанию ---
 /*.spec
 installer/Output/
+
+# --- Личные заметки с ключами (не коммитить) ---
+info.txt

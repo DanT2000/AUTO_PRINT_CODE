@@ -44,6 +44,18 @@ def comment_spans(text: str, lang: str) -> list[tuple[int, int]]:
     return _comment_spans(text, *spec) if spec else []
 
 
+def comment_line(text: str, lang: str) -> str:
+    """Строка-комментарий на языке lang: «# текст», «// текст», «-- текст», «/* текст */», «<!-- текст -->»."""
+    spec = _LANGS.get((lang or "").lower())
+    if spec is None:
+        return f"# {text}"
+    line_marks, blocks, _q = spec
+    if line_marks:
+        return f"{line_marks[0]} {text}"
+    a, b = blocks[0]
+    return f"{a} {text} {b}"
+
+
 _MARKS = re.compile(r"^\s*(?:#+|//+|/\*+|<!--|--)\s?|\s*(?:\*+/|-->)\s*$")
 
 

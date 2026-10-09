@@ -126,12 +126,21 @@ class ProviderBox:
         self.key.setText(c.key)
         self.key.setPlaceholderText("ключ доступа" + ("" if p.needs_key else " (если сервер просит)"))
         self.model.clear()
-        models = list(p.models)
-        if c.model and c.model not in models:
-            models.insert(0, c.model)
-        self.model.addItems(models)
-        self.model.setCurrentText(c.model)
-        self.refresh_btn.setVisible(p.kind == "openai")
+        cli = p.kind == "cli"
+        self.model.setEditable(not cli)   # у агентов — готовый список с понятными подписями
+        if cli:
+            for mid, title in p.models:
+                self.model.addItem(title, mid)
+            if self.model.findData(c.model) < 0:
+                self.model.addItem(c.model, c.model)   # сохранённая раньше модель не из списка — показать её
+            self.model.setCurrentIndex(self.model.findData(c.model))
+        else:
+            ids = [m for m, _t in p.models]
+            if c.model and c.model not in ids:
+                ids.insert(0, c.model)
+            self.model.addItems(ids)
+            self.model.setCurrentText(c.model)
+        self.refresh_btn.setVisible(not cli)
         self._loading = was
         why = ai.problem(c)
         self.check_info.setText(why or "")
@@ -157,10 +166,12 @@ class ProviderBox:
             self.win.changed.emit("ai")
             self._fill_problem()
 
-    def _save_model(self, text: str) -> None:
+    def _save_model(self, _text: str = "") -> None:
         p = self.pid()
         if p and not self._loading:
-            self.s.ai_models[p] = text.strip()
+            prov = ai.provider(p)
+            value = self.model.currentData() if prov and prov.kind == "cli" else self.model.currentText()
+            self.s.ai_models[p] = (value or "").strip()
             self.win.changed.emit("ai")
 
     def _fill_problem(self) -> None:
@@ -259,11 +270,12 @@ def build_page(win) -> QWidget:
 
     lay.addWidget(group_title("Ожидание"))
     c3 = Card()
-    wait = spin(0, 900, win.s.ai_timeout_s, " с", step=30)
-    wait.setSpecialValueText("по длине кода")
-    wait.valueChanged.connect(lambda v: win._set("ai_timeout_s", v))
-    c3.add(Row("clock", "Сколько ждать ответ", "«По длине кода» — от минуты до пяти; агентам по подписке — "
-               "не меньше трёх минут", [wait]))
+    wait = spin(0, 60, round(win.s.ai_timeout_s / 60), " мин", step=1)
+    wait.setSpecialValueText("авто")
+    wait.valueChanged.connect(lambda v: win._set("ai_timeout_s", v * 60))
+    c3.add(Row("clock", "Сколько ждать ответ", "«Авто» — по длине кода: серверу от 2 до 20 минут, агентам по "
+               "подписке — до 20 минут. Пока ответ идёт, в окне импорта видно, что нейросеть думает и пишет",
+               [wait]))
     lay.addWidget(c3)
     lay.addSpacing(12)
     lay.addWidget(Note("Код уходит на сервер выбранной нейросети. LM Studio и Ollama работают на этом компьютере — "
@@ -274,7 +286,7 @@ def build_page(win) -> QWidget:
         win.ai_main.load()
         win.ai_backup.load()
         sw.setChecked(win.s.ai_backup_enabled)
-        wait.setValue(win.s.ai_timeout_s)
+        wait.setValue(round(win.s.ai_timeout_s / 60))
     win._loaders.append(reload)
     win._finish(lay)
     return page

@@ -5,13 +5,15 @@
 """
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
 
-from .widgets import IconLabel, label
+from .widgets import IconButton, IconLabel, label
 
 
 class Prompter(QFrame):
+    detach_clicked = Signal()
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("card")
@@ -26,6 +28,10 @@ class Prompter(QFrame):
         head.addWidget(self.title, 1)
         self.hint = label("", "faint")
         head.addWidget(self.hint)
+        detach = IconButton("external", "Суфлёр в отдельном окне: поверх всех окон, с кнопками «Дальше» "
+                            "и «Назад», можно набирать код самому", 14, box=26)
+        detach.clicked.connect(self.detach_clicked)
+        head.addWidget(detach)
         lay.addLayout(head)
         self.say = QLabel()
         self.say.setObjectName("prompterSay")

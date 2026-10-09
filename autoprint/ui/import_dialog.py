@@ -11,7 +11,9 @@
 """
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
@@ -29,6 +31,8 @@ from .widgets import Card, Note, Row, Segmented, Switch, Toast, accent_button, b
 
 TAB_FILE, TAB_PASTE, TAB_AI = "file", "paste", "ai"
 
+log = logging.getLogger("autoprint.ai")
+
 STYLE_HINTS = {
     L.STYLE_COMMENTS: "Код целиком, в нём комментарии — что сказать перед каждым куском. Печать «По строкам»: "
                       "комментарий — на суфлёре, Enter — следующая строка.",
@@ -41,7 +45,8 @@ STYLE_HINTS = {
 
 class _Job(QObject):
     """Запрос к нейросети в фоновом потоке; сигналы приходят в поток окна."""
-    status = Signal(str)
+    status = Signal(str)         # кто отвечает
+    progress = Signal(str, int, str)   # фаза (connect | think | write), знаков, хвост ответа
     done = Signal(str, str)      # ответ, кто ответил
     failed = Signal(str)
 
@@ -100,6 +105,8 @@ class ImportDialog(QDialog):
             b.setDefault(False)
 
         self.toast = Toast(self.stack)
+        self._tick = QTimer(self, interval=500, timeout=self._refresh_progress)   # часы хода работы
+        self._t0, self._who, self._phase, self._chars, self._preview = 0.0, "", "connect", 0, ""
         self.paste_edit.textChanged.connect(self._paste_timer.start)
         self.answer_edit.textChanged.connect(self._answer_timer.start)
         self._restyle()
@@ -225,6 +232,18 @@ class ImportDialog(QDialog):
         il.setContentsMargins(48, 0, 16, 12)
         il.addWidget(self.ai_info)
         c2.add(info_row)
+        # ход работы: кто отвечает, что делает (думает / пишет ответ), сколько прошло, хвост ответа
+        self.progress_row = QWidget()
+        pl = QVBoxLayout(self.progress_row)
+        pl.setContentsMargins(48, 0, 16, 12)
+        pl.setSpacing(4)
+        self.progress_lbl = label("", "progressText")
+        self.progress_tail = label("", "progressTail")
+        self.progress_tail.setTextFormat(Qt.TextFormat.PlainText)
+        pl.addWidget(self.progress_lbl)
+        pl.addWidget(self.progress_tail)
+        self.progress_row.hide()
+        c2.add(self.progress_row)
         lay.addWidget(c2)
 
         lay.addWidget(group_title("4. Ответ нейросети"))
@@ -270,6 +289,8 @@ QLabel#dropTitle {{ font-size: 16px; font-weight: 600; }}
 QLabel#dropSub, QLabel#importLabel {{ color: {t.css('dim')}; }}
 QLabel#importStatus {{ color: {t.css('dim')}; }}
 QLabel#answerInfo {{ color: {t.css('dim')}; }}
+QLabel#progressText {{ color: {t.css('accent')}; font-weight: 600; }}
+QLabel#progressTail {{ color: {t.css('faint')}; font-family: "{t.mono_family}"; font-size: 11px; }}
 QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ background: transparent; }}
 """)
 
@@ -302,7 +323,8 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
     def _options(self) -> L.Options:
         return L.Options(style=self.style_seg.value() or L.STYLE_STEPS, task=self.sw_task.isChecked(),
                          explain=self.sw_explain.isChecked(), keep_code=self.sw_keep.isChecked(),
-                         detail=self.detail_seg.value() or L.DETAIL_SHORT)
+                         detail=self.detail_seg.value() or L.DETAIL_SHORT,
+                         marks=L.is_big(self.material.toPlainText()))
 
     def _remember_options(self) -> None:
         o = self._options()
@@ -321,15 +343,19 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
         if busy:
             return
         c = ai.config(self.settings)
+        material = self.material.toPlainText()
+        big = (f"<br>Код большой ({len(L.source_lines(material))} строк): нейросеть не будет переписывать его, "
+               "а только разметит строки — шаги и что сказать. Так быстрее, и код останется точно вашим."
+               if has and L.is_big(material) else "")
         if ok:
             self.ai_info.setText(f"Ответит: <b>{c.provider.name}</b>{(' · ' + c.model) if c.model else ''}. "
-                                 "<a href='ai'>Сменить…</a>")
+                                 "<a href='ai'>Сменить…</a>" + big)
         elif c is not None:
             self.ai_info.setText(f"{c.provider.name}: {ai.problem(c) or 'не настроено'} "
-                                 "<a href='ai'>Настроить…</a> Или «Скопировать промпт» — в свой чат.")
+                                 "<a href='ai'>Настроить…</a> Или «Скопировать промпт» — в свой чат." + big)
         else:
             self.ai_info.setText("Нейросеть не подключена. <a href='ai'>Подключить…</a> — или «Скопировать "
-                                 "промпт»: вставьте его в свой чат (ChatGPT, Claude…), а ответ — в поле ниже.")
+                                 "промпт»: вставьте его в свой чат (ChatGPT, Claude…), а ответ — в поле ниже." + big)
 
     def _connect_ai(self) -> None:
         if self.open_ai_settings:
@@ -429,17 +455,24 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
         cancel = self._cancel
         job = _Job(self)
         job.status.connect(self._on_status)
+        job.progress.connect(self._on_progress)
         job.done.connect(self._on_answer)
         job.failed.connect(self._on_failed)
         self._job = job
+        self._t0 = time.monotonic()
+        self._who, self._phase, self._chars, self._preview = ai.config(self.settings).provider.name, "connect", 0, ""
         self._update_ai_buttons()
-        self._on_status("Отправляю…")
+        self.answer_info.setText("")
+        self.progress_row.show()
+        self._tick.start()
+        self._refresh_progress()
         self._show_answer()
 
         def work() -> None:
             try:
-                text, who = ai.ask(self.settings, L.instruction(opt), L.material_message(material), cancel,
-                                   on_status=job.status.emit)
+                text, who = ai.ask(self.settings, L.instruction(opt), L.material_message(material, opt.marks),
+                                   cancel,
+                                   on_status=job.status.emit, on_progress=job.progress.emit)
                 if not cancel.is_set():
                     job.done.emit(text, who)
             except ai.Cancelled:
@@ -456,14 +489,41 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
         if self._cancel is not None:
             self._cancel.set()
         self._cancel = None
+        self._stop_progress()
         self._update_ai_buttons()
         self.answer_info.setText("Отменено.")
 
-    def _on_status(self, text: str) -> None:
-        self.answer_info.setText(text + " Это может занять до пары минут.")
+    def _on_status(self, who: str) -> None:
+        self._who, self._phase, self._chars, self._preview = who, "connect", 0, ""
+        self._refresh_progress()
+
+    def _on_progress(self, phase: str, chars: int, preview: str) -> None:
+        self._phase, self._chars = phase, chars
+        if preview:
+            self._preview = preview
+        self._refresh_progress()
+
+    def _refresh_progress(self) -> None:
+        if self._cancel is None:
+            return
+        sec = int(time.monotonic() - self._t0)
+        clock = f"{sec // 60}:{sec % 60:02d}"
+        n = f"{self._chars:,}".replace(",", " ")
+        what = {"connect": "жду ответа",
+                "think": f"думает — объём рассуждений {n}" if self._chars else "думает",
+                "write": f"пишет ответ — {n} знаков"}.get(self._phase, "работает")
+        self.progress_lbl.setText(f"{self._who}: {what} · {clock}")
+        tail = self._preview if self._phase == "write" else ("Связь есть, ответ формируется — это нормально, "
+                                                               "большой код разбирается несколько минут." if sec > 20 else "")
+        self.progress_tail.setText(tail)
+
+    def _stop_progress(self) -> None:
+        self._tick.stop()
+        self.progress_row.hide()
 
     def _on_answer(self, text: str, who: str) -> None:
         self._cancel = None
+        self._stop_progress()
         self._update_ai_buttons()
         self.answer_edit.setPlainText(text)
         self._parse_answer(who)
@@ -471,6 +531,7 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
 
     def _on_failed(self, msg: str) -> None:
         self._cancel = None
+        self._stop_progress()
         self._update_ai_buttons()
         self.answer_info.setText(f"Нейросеть не ответила: {msg}")
         self.toast.show_message("Нейросеть не ответила — можно «Скопировать промпт» и спросить свой чат.", warn=True)
@@ -491,7 +552,7 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
                 self.answer_info.setText("")
             return
         try:
-            parsed = L.parse_lesson(text)
+            parsed = L.parse_lesson(text, material=self.material.toPlainText(), style=self._options().style)
         except L.LessonError as e:
             self.status.setText("Ответ не разобрать.")
             self.answer_info.setText(str(e))
@@ -505,6 +566,8 @@ QScrollArea#importScroll, QScrollArea#importScroll > QWidget > QWidget {{ backgr
                 notes.insert(0, "Внимание: нейросеть изменила код (без учёта комментариев):\n  "
                              + "\n  ".join(diff[:8]))
         head = f"«{parsed.template.title}» — {parsed.summary}" + (f" · ответил {who}" if who else "")
+        if who:
+            log.info("Импорт нейросетью: %s · замечаний: %d", parsed.summary, len(notes))
         self.answer_info.setText(head + ("\n" + "\n".join(notes) if notes else ""))
         self.status.setText("Готово — можно добавить занятие." if not notes else "Готово, но проверьте замечания.")
         self.add_btn.setEnabled(True)

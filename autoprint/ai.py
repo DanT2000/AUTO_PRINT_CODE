@@ -41,17 +41,26 @@ class Provider:
     model: str = ""              # модель по умолчанию
     needs_key: bool = False
     json_mode: bool = False      # сервер понимает response_format: json_object
-    models: tuple = ()           # фиксированный список моделей (cli)
+    models: tuple = ()           # готовый список моделей: ((id, подпись), …)
     hint: str = ""
 
 
 PROVIDERS: tuple[Provider, ...] = (
     Provider("claudeCli", "Claude — по подписке (Claude Code)", "cli", model="sonnet",
-             models=("haiku", "sonnet", "opus"),
-             hint="Через установленную программу Claude Code и вашу подписку Claude — ключ не нужен. "
-                  "sonnet — лучшее соотношение качества и скорости, haiku — быстрее, opus — сильнее."),
+             models=(("", "Как в Claude Code"), ("haiku", "Haiku — быстрая"), ("sonnet", "Sonnet — рабочая лошадка"),
+                     ("opus", "Opus — самая сильная")),
+             hint="Через установленную программу Claude Code и вашу подписку Claude — ключ не нужен. Запрос "
+                  "уходит «голой» модели: без инструментов и настроек проекта — быстрее и дешевле."),
     Provider("codexCli", "ChatGPT — по подписке (Codex CLI)", "cli", model="",
+             models=(("", "Как в Codex"), ("gpt-5.6-luna", "gpt-5.6-luna — полегче"),
+                     ("gpt-5.6-terra", "gpt-5.6-terra — средняя"), ("gpt-5.6-sol", "gpt-5.6-sol — по умолчанию у Codex")),
              hint="Через установленную программу Codex и вашу подписку ChatGPT — ключ не нужен."),
+    Provider("freeai", "FreeAI (бесплатные лимиты)", "openai", url="https://freeai.dev.appswire.ru/v1",
+             model="text-medium", needs_key=True,
+             models=(("text-medium", "text-medium"), ("text-hard", "text-hard"), ("text", "text"),
+                     ("text-easy", "text-easy")),
+             hint="Сам подбирает доступную бесплатную модель. text-medium — по умолчанию, text-hard — сильнее "
+                  "(для большого кода), text-easy — быстрее. Ключ «fk-…» — в FreeAI."),
     Provider("openai", "ChatGPT (OpenAI API)", "openai", url="https://api.openai.com/v1", model="gpt-4o-mini",
              needs_key=True, json_mode=True, hint="Ключ — на platform.openai.com → API keys. Оплата по запросам."),
     Provider("deepseek", "DeepSeek", "openai", url="https://api.deepseek.com/v1", model="deepseek-chat",
@@ -139,8 +148,10 @@ def config(settings, pid: str | None = None) -> Config | None:
     p = provider(pid if pid is not None else settings.ai_provider)
     if p is None:
         return None
+    # модель: выбранная (в том числе пустая — «как в программе» у агентов), а если не выбирали — по умолчанию
+    model = settings.ai_models[p.id] if p.id in settings.ai_models else p.model
     return Config(p, (settings.ai_urls.get(p.id) or p.url).strip(), unprotect(settings.ai_keys.get(p.id, "")),
-                  (settings.ai_models.get(p.id) or p.model).strip())
+                  (model or "").strip())
 
 
 def configured(settings) -> bool:
@@ -168,12 +179,21 @@ def problem(c: Config) -> str | None:
 
 
 # ---------------------------------------------------------------- запросы
+#
+# Ход запроса виден: on_progress(phase, chars, preview) — «connect» (жду ответа), «think» (думает: chars —
+# примерно сколько «токенов рассуждений»), «write» (пишет ответ: chars — сколько знаков уже пришло, preview —
+# хвост ответа). Без ограничения «5 минут»: большой код агент по подписке разбирает и дольше — ждём до 20 минут
+# (настройка), а у сервера — пока данные идут (2 минуты тишины — ошибка).
+
+IDLE_S = 120          # сервер замолчал дольше — ошибка
+CLI_DEFAULT_S = 1200  # агент по подписке — до 20 минут
+
 
 def timeout_for(settings, text_len: int, cli: bool) -> float:
+    """Сколько ждать ответа целиком."""
     if settings.ai_timeout_s > 0:
         return float(settings.ai_timeout_s)
-    t = min(60 + text_len * 0.03, 300)
-    return max(t, 180) if cli else t
+    return float(CLI_DEFAULT_S) if cli else min(120 + text_len * 0.05, 1200)
 
 
 def chat_url(base: str) -> str:
@@ -190,26 +210,39 @@ def _clean(text: str) -> str:
     return _THINK.sub("", text or "").strip()
 
 
-def _http_json(url: str, payload: dict | None, key: str, timeout: float) -> dict:
+def _tail(text: str, n: int = 90) -> str:
+    t = " ".join(text[-400:].split())
+    return t[-n:]
+
+
+def _request(url: str, payload: dict | None, key: str) -> urllib.request.Request:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = urllib.request.Request(url, data=data, method="POST" if data else "GET",
                                  headers={"Content-Type": "application/json", "User-Agent": "AutoPrintCode"})
     if key:
         req.add_header("Authorization", f"Bearer {key}")
+    return req
+
+
+def _http_error(e: urllib.error.HTTPError) -> AIError:
+    body = e.read().decode("utf-8", errors="replace")[:400]
+    msg = body
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        j = json.loads(body)
+        msg = (j.get("error") or {}).get("message") if isinstance(j.get("error"), dict) else j.get("error") or body
+    except ValueError:
+        pass
+    err = AIError(_http_hint(e.code, str(msg)))
+    err.status = e.code
+    return err
+
+
+def _http_json(url: str, payload: dict | None, key: str, timeout: float) -> dict:
+    try:
+        with urllib.request.urlopen(_request(url, payload, key), timeout=timeout) as r:
             return json.loads(r.read().decode("utf-8", errors="replace"))
     except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:400]
-        msg = body
-        try:
-            j = json.loads(body)
-            msg = (j.get("error") or {}).get("message") if isinstance(j.get("error"), dict) else j.get("error") or body
-        except ValueError:
-            pass
-        err = AIError(_http_hint(e.code, str(msg)))
-        err.status = e.code
-        raise err from None
+        raise _http_error(e) from None
     except urllib.error.URLError as e:
         raise AIError(f"Сервер не отвечает: {e.reason}. Проверьте адрес и что сервер запущен.") from None
     except TimeoutError:
@@ -227,40 +260,117 @@ def _http_hint(code: int, msg: str) -> str:
         return f"Не найдено (404): {msg[:160]} — проверьте адрес и название модели."
     if code == 429:
         return "Слишком много запросов или исчерпан лимит (429) — подождите и попробуйте снова."
+    if code in (502, 503, 504):
+        return (f"Сервер-посредник не дождался ответа модели ({code}) — модель перегружена или думает дольше, "
+                "чем ждёт сервер. Попробуйте ещё раз или другую модель.")
     return f"Ошибка сервера {code}: {msg[:200]}"
 
 
-def _openai_chat(c: Config, system: str, user: str, timeout: float, json_mode: bool) -> str:
-    payload = {"model": c.model, "temperature": 0.2, "stream": False,
+def _openai_stream(c: Config, payload: dict, deadline: float, cancel, progress) -> str:
+    """Потоковый ответ (SSE): видно, как он приходит. Сервер не умеет поток — ответит обычным JSON, разберём его."""
+    payload = dict(payload, stream=True)
+    try:
+        r = urllib.request.urlopen(_request(chat_url(c.url), payload, c.key), timeout=IDLE_S)
+    except urllib.error.HTTPError as e:
+        raise _http_error(e) from None
+    except urllib.error.URLError as e:
+        raise AIError(f"Сервер не отвечает: {e.reason}. Проверьте адрес и что сервер запущен.") from None
+    except TimeoutError:
+        raise AIError("Сервер не ответил за 2 минуты — попробуйте ещё раз или другую модель.") from None
+    parts: list[str] = []
+    thinking = 0
+    finish = ""
+    try:
+        with r:
+            if "event-stream" not in (r.headers.get("Content-Type") or ""):
+                data = json.loads(r.read().decode("utf-8", errors="replace"))
+                choice = data["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    raise _cut_off(len(choice["message"].get("content") or ""))
+                return choice["message"]["content"] or ""
+            for raw in r:
+                if cancel is not None and cancel.is_set():
+                    raise Cancelled("Отменено.")
+                if time.monotonic() > deadline:
+                    raise AIError("Нейросеть отвечает слишком долго — попробуйте модель полегче или увеличьте "
+                                  "ожидание (⚙ → Нейросеть).")
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    choice = json.loads(body)["choices"][0]
+                    delta = choice.get("delta") or {}
+                except (ValueError, KeyError, IndexError, TypeError):
+                    continue
+                finish = choice.get("finish_reason") or finish
+                if delta.get("reasoning_content") or delta.get("reasoning"):
+                    thinking += len(delta.get("reasoning_content") or delta.get("reasoning") or "")
+                    if progress:
+                        progress("think", thinking, "")
+                if delta.get("content"):
+                    parts.append(delta["content"])
+                    if progress:
+                        text = "".join(parts)
+                        progress("write", len(text), _tail(text))
+    except TimeoutError:
+        raise AIError("Сервер замолчал больше чем на 2 минуты — попробуйте ещё раз.") from None
+    except (KeyError, IndexError, TypeError, ValueError):
+        raise AIError("Сервер ответил не в формате chat/completions.") from None
+    if finish == "length":
+        raise _cut_off(len("".join(parts)))
+    return "".join(parts)
+
+
+def _cut_off(chars: int) -> AIError:
+    return AIError(f"Ответ оборвался на {chars} знаках: модель упёрлась в предел длины ответа. Выберите модель "
+                   "сильнее или разберите код по частям.")
+
+
+def _openai_chat(c: Config, system: str, user: str, timeout: float, json_mode: bool, cancel=None,
+                 progress=None) -> str:
+    payload = {"model": c.model, "temperature": 0.2,
                "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     if json_mode and c.provider.json_mode:
         payload["response_format"] = {"type": "json_object"}
-    try:
-        data = _http_json(chat_url(c.url), payload, c.key, timeout)
-    except AIError as e:
-        if getattr(e, "status", 0) in (400, 422) and "response_format" in payload:
-            payload.pop("response_format")   # сервер не понял «ответ строго JSON» — без него
-            data = _http_json(chat_url(c.url), payload, c.key, timeout)
-        else:
+    deadline = time.monotonic() + timeout
+    for attempt in range(2):
+        try:
+            return _clean(_openai_stream(c, payload, deadline, cancel, progress))
+        except AIError as e:
+            if attempt == 0 and getattr(e, "status", 0) in (400, 422) and "response_format" in payload:
+                payload.pop("response_format")   # сервер не понял «ответ строго JSON» — без него
+                continue
             raise
-    try:
-        return _clean(data["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError):
-        raise AIError("Сервер ответил не в формате chat/completions.") from None
+    raise AIError("Сервер не ответил.")
 
 
 def cli_path(p: Provider) -> str | None:
     return shutil.which("claude" if p.id == "claudeCli" else "codex")
 
 
-def _cli_args(c: Config) -> list[str]:
+def _empty_dir() -> str:
+    """Пустая папка для агента: без CLAUDE.md/AGENTS.md и файлов чужого проекта."""
+    import tempfile
+    d = os.path.join(tempfile.gettempdir(), "AutoPrintCode-ai")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _cli_args(c: Config, system_file: str) -> list[str]:
     exe = cli_path(c.provider)
     if c.provider.id == "claudeCli":
-        args = [exe, "-p", "--output-format", "text"]
+        # «голая» модель: свой системный промпт вместо агентского, без инструментов, MCP, хуков и настроек —
+        # ей нужно только переписать текст. Ход работы — потоком событий
+        args = [exe, "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
+                "--system-prompt-file", system_file, "--tools", "", "--strict-mcp-config",
+                "--setting-sources", "", "--no-session-persistence", "--disable-slash-commands"]
         if c.model:
             args += ["--model", c.model]
         return args
-    args = [exe, "exec", "--skip-git-repo-check", "--ephemeral", "-s", "read-only"]
+    args = [exe, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-s", "read-only"]
     if c.model:
         args += ["-m", c.model]
     return args + ["-"]
@@ -273,7 +383,7 @@ _CLI_ERRORS = ((re.compile(r"login|log in|authenticat|not logged|unauthori", re.
 
 
 def _kill_tree(proc: subprocess.Popen) -> None:
-    """claude/codex в Windows — обёртка .cmd: убить нужно всё дерево, иначе сам агент продолжит работать."""
+    """claude/codex в Windows бывает обёрткой .cmd: убить нужно всё дерево, иначе сам агент продолжит работать."""
     try:
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -281,60 +391,134 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _cli_chat(c: Config, system: str, user: str, timeout: float, cancel: threading.Event | None) -> str:
-    prompt = ("Ты — молчаливый инструмент: выполни задание и выведи только результат, без вступлений.\n\n"
-              + system + "\n\n" + user)
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    try:
-        proc = subprocess.Popen(_cli_args(c), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, creationflags=flags, cwd=os.path.expanduser("~"))
-    except OSError as e:
-        raise AIError(f"Не удалось запустить {c.provider.name}: {e}") from None
-    out: dict = {}
+def _cli_event(c: Config, ev: dict, state: dict, progress) -> None:
+    """Событие потока агента → ход работы и ответ."""
+    t = ev.get("type")
+    if c.provider.id == "claudeCli":
+        if t == "system" and ev.get("subtype") == "thinking_tokens":
+            state["think"] = int(ev.get("estimated_tokens") or 0)
+            if progress:
+                progress("think", state["think"], "")
+        elif t == "stream_event":
+            d = (ev.get("event") or {}).get("delta") or {}
+            if d.get("stop_reason") == "max_tokens":
+                state["cut"] = True
+            if d.get("type") == "text_delta":
+                state["text"] += d.get("text") or ""
+                if progress:
+                    progress("write", len(state["text"]), _tail(state["text"]))
+        elif t == "result":
+            state["result"] = ev.get("result") or ""
+            state["error"] = bool(ev.get("is_error"))
+        return
+    # Codex: item.completed (рассуждения, сообщения), turn.completed
+    if t == "item.completed":
+        item = ev.get("item") or {}
+        if item.get("type") == "agent_message":
+            state["result"] = item.get("text") or ""
+            if progress:
+                progress("write", len(state["result"]), _tail(state["result"]))
+        elif item.get("type") == "reasoning" and progress:
+            state["think"] += 1
+            progress("think", state["think"], "")
+    elif t in ("turn.failed", "error"):
+        state["error"] = True
+        state["result"] = json.dumps(ev, ensure_ascii=False)[:300]
 
-    def talk():
+
+def _cli_chat(c: Config, system: str, user: str, timeout: float, cancel: threading.Event | None,
+              progress=None) -> str:
+    import tempfile
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    fd, sys_file = tempfile.mkstemp(prefix="apc-system-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write("Ты — молчаливый инструмент: выполни задание и выведи только результат, без вступлений.\n\n" + system)
+    stdin_text = user if c.provider.id == "claudeCli" else (
+        "Ты — молчаливый инструмент: выполни задание и выведи только результат, без вступлений.\n\n"
+        + system + "\n\n" + user)
+    try:
+        proc = subprocess.Popen(_cli_args(c, sys_file), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, creationflags=flags, cwd=_empty_dir())
+    except OSError as e:
+        os.unlink(sys_file)
+        raise AIError(f"Не удалось запустить {c.provider.name}: {e}") from None
+    state = {"text": "", "think": 0, "result": None, "error": False}
+    err_buf: list[bytes] = []
+
+    def feed() -> None:
         try:
-            out["o"], out["e"] = proc.communicate(prompt.encode("utf-8"))
-        except Exception as e:   # noqa: BLE001 — любая беда общения с процессом
-            out["x"] = e
-    th = threading.Thread(target=talk, daemon=True)
-    th.start()
+            proc.stdin.write(stdin_text.encode("utf-8"))
+            proc.stdin.close()
+        except OSError:
+            pass
+
+    def read_out() -> None:
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                _cli_event(c, json.loads(line), state, progress)
+            except ValueError:
+                continue
+
+    def read_err() -> None:
+        err_buf.append(proc.stderr.read())
+    threads = [threading.Thread(target=f, daemon=True) for f in (feed, read_out, read_err)]
+    for th in threads:
+        th.start()
+    if progress:
+        progress("connect", 0, "")
     end = time.monotonic() + timeout
-    while th.is_alive():
-        th.join(0.2)
-        if cancel is not None and cancel.is_set() or time.monotonic() > end:
-            _kill_tree(proc)
-            th.join(2)
+    try:
+        while proc.poll() is None:
+            time.sleep(0.2)
             if cancel is not None and cancel.is_set():
+                _kill_tree(proc)
                 raise Cancelled("Отменено.")
-            raise AIError("Нейросеть не ответила вовремя — попробуйте ещё раз.")
-    text = (out.get("o") or b"").decode("utf-8", errors="replace")
-    err = (out.get("e") or b"").decode("utf-8", errors="replace")
-    if proc.returncode != 0 or not text.strip():
+            if time.monotonic() > end:
+                _kill_tree(proc)
+                raise AIError(f"{c.provider.name} не закончил за {int(timeout // 60)} мин — попробуйте модель "
+                              "побыстрее или увеличьте ожидание (⚙ → Нейросеть).")
+        for th in threads[1:]:
+            th.join(5)
+    finally:
+        try:
+            os.unlink(sys_file)
+        except OSError:
+            pass
+    err = b"".join(err_buf).decode("utf-8", errors="replace")
+    result = state["result"] if state["result"] is not None else state["text"]
+    if state.get("cut"):
+        raise _cut_off(len(result or ""))
+    if proc.returncode != 0 or state["error"] or not (result or "").strip():
+        blob = f"{err}\n{result or ''}"
         for rx, hint in _CLI_ERRORS:
-            if rx.search(err) or rx.search(text):
+            if rx.search(blob):
                 raise AIError(hint)
-        raise AIError(f"{c.provider.name} завершился с ошибкой: {(err or text).strip()[:300]}")
-    return _clean(text)
+        raise AIError(f"{c.provider.name} завершился с ошибкой: {(err or result or 'пустой ответ').strip()[:300]}")
+    return _clean(result)
 
 
 def chat(c: Config, system: str, user: str, timeout: float, cancel: threading.Event | None = None,
-         json_mode: bool = True) -> str:
+         json_mode: bool = True, progress=None) -> str:
     """Один запрос к провайдеру. AIError — с понятной причиной."""
     why = problem(c)
     if why:
         raise AIError(why)
     if c.provider.kind == "cli":
-        return _cli_chat(c, system, user, timeout, cancel)
+        return _cli_chat(c, system, user, timeout, cancel, progress)
     result: dict = {}
 
     def run():
         try:
-            result["t"] = _openai_chat(c, system, user, timeout, json_mode)
+            result["t"] = _openai_chat(c, system, user, timeout, json_mode, cancel, progress)
         except Exception as e:   # noqa: BLE001
             result["x"] = e
     th = threading.Thread(target=run, daemon=True)
     th.start()
+    if progress:
+        progress("connect", 0, "")
     while th.is_alive():
         th.join(0.2)
         if cancel is not None and cancel.is_set():
@@ -344,47 +528,69 @@ def chat(c: Config, system: str, user: str, timeout: float, cancel: threading.Ev
     return result["t"]
 
 
+def _ask_one(settings, c: Config, system: str, user: str, cancel, progress) -> str:
+    n = len(system) + len(user)
+    t0 = time.monotonic()
+    log.info("Нейросеть: запрос → %s · модель %s · %d знаков", c.provider.name, c.model or "по умолчанию", n)
+    try:
+        text = chat(c, system, user, timeout_for(settings, n, c.provider.kind == "cli"), cancel, progress=progress)
+    except Cancelled:
+        log.info("Нейросеть: отменено через %.0f с", time.monotonic() - t0)
+        raise
+    except AIError as e:
+        log.warning("Нейросеть: %s не ответил за %.0f с: %s", c.provider.name, time.monotonic() - t0, e)
+        raise
+    log.info("Нейросеть: ответ от %s за %.0f с · %d знаков", c.provider.name, time.monotonic() - t0, len(text))
+    return text
+
+
 def ask(settings, system: str, user: str, cancel: threading.Event | None = None,
-        on_status=None) -> tuple[str, str]:
+        on_status=None, on_progress=None) -> tuple[str, str]:
     """Запрос основному провайдеру, при ошибке — запасному. → (ответ, имя провайдера)."""
     main = config(settings)
     if main is None:
         raise AIError("Нейросеть не подключена — ⚙ Настройки → Нейросеть, или «Скопировать промпт».")
-    n = len(system) + len(user)
     try:
         if on_status:
-            on_status(f"Спрашиваю {main.provider.name}…")
-        return chat(main, system, user, timeout_for(settings, n, main.provider.kind == "cli"), cancel), \
-            main.provider.name
+            on_status(main.provider.name)
+        return _ask_one(settings, main, system, user, cancel, on_progress), main.provider.name
     except Cancelled:
         raise
     except AIError as e:
         back = config(settings, settings.ai_backup_provider) if settings.ai_backup_enabled else None
         if back is None or back.provider.id == main.provider.id:
             raise
+        why = problem(back)
+        if why:   # запасная не настроена (например, без ключа) — её ошибка только запутала бы
+            log.warning("Запасная %s не настроена (%s) — не пробую", back.provider.name, why)
+            raise AIError(f"{e} Запасная ({back.provider.name}) не настроена: {why}") from None
         log.warning("Основной провайдер не справился (%s) — пробую запасной: %s", e, back.provider.name)
         if on_status:
-            on_status(f"{main.provider.name} не ответил — спрашиваю запасного: {back.provider.name}…")
+            on_status(back.provider.name + f" (запасная: {main.provider.name} не ответил)")
         try:
-            return chat(back, system, user, timeout_for(settings, n, back.provider.kind == "cli"), cancel), \
-                back.provider.name
+            return _ask_one(settings, back, system, user, cancel, on_progress), back.provider.name
         except AIError as e2:
             if isinstance(e2, Cancelled):
                 raise
             raise AIError(f"Не ответили оба. {main.provider.name}: {e}  {back.provider.name}: {e2}") from None
 
 
+_NOT_TEXT = re.compile(r"embed|whisper|tts|rerank|moderation|audio|image|diffusion|flux|nova-|dall-e", re.I)
+
+
 def list_models(c: Config, timeout: float = 15) -> list[str]:
-    """Модели сервера (GET /v1/models), без эмбеддингов и распознавания речи; у cli — свой список."""
+    """Модели сервера (GET /v1/models) — только текстовые; у cli — свой список."""
     if c.provider.kind == "cli":
-        return list(c.provider.models)
+        return [m for m, _t in c.provider.models]
     why = problem(c)
     if why:
         raise AIError(why)
     url = chat_url(c.url).rsplit("/chat/completions", 1)[0] + "/models"
     data = _http_json(url, None, c.key, timeout)
     ids = [str(m.get("id")) for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
-    return sorted(i for i in ids if not re.search(r"embed|whisper|tts|rerank|moderation", i, re.I))
+    presets = [m for m, _t in c.provider.models]
+    rest = sorted(i for i in ids if not _NOT_TEXT.search(i) and i not in presets)
+    return [m for m in presets if m in ids or not ids] + rest
 
 
 def check(c: Config, timeout: float = 60) -> tuple[int, str]:

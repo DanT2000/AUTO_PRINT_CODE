@@ -1,17 +1,22 @@
 ; Установщик AutoPrintCode (Inno Setup 6.3+). Обычно собирается из tools\build_exe.py:
 ;   ISCC /DAppVersion=0.5.0 /DAppNumVersion=0.5.0.0 /DSourceDir=..\dist\AutoPrintCode /DOutputDir=..\dist installer\AutoPrintCode.iss
 ;
-; Первая страница — «Как установить»:
-; - Установить (по умолчанию). Для текущего пользователя, без прав администратора, в
-;   %LOCALAPPDATA%\Programs\AutoPrintCode (папку можно выбрать): ярлык в «Пуске», удаление через
-;   «Параметры → Приложения». В папку программы можно писать — она обновляется из релизов GitHub сама.
+; Сначала Windows спрашивает, для кого ставить (стандартное окно Inno Setup):
+; - для всех пользователей (по умолчанию, нужны права администратора) — в Program Files. Данные каждого
+;   пользователя — в %APPDATA%\AutoPrintCode; обновляется программа установщиком из релиза (с запросом прав);
+; - только для меня — без прав администратора, в %LOCALAPPDATA%\Programs\AutoPrintCode, данные — в data\
+;   рядом с программой, обновляется сама.
+; Затем страница «Как установить»:
+; - Установить. Ярлык в «Пуске», удаление через «Параметры → Приложения». Прежняя копия «только для меня»
+;   при установке для всех удаляется, а её занятия и настройки программа перенесёт при первом запуске.
 ; - Если программа уже установлена — «Обновить установленную версию»: та же папка, без лишних вопросов.
 ; - Портативная версия: просто папка с программой (например, на флешке). Ничего не прописывается в Windows —
 ;   ни ярлыков, ни записи в «Приложениях»; образцы и настройки — в папке data рядом с программой.
-; Папку data\ (образцы, настройки, журнал) не трогают ни обновление, ни удаление программы.
+; Данные (образцы, настройки, журнал) не трогают ни обновление, ни удаление программы.
 ;
 ; Тихая установка (и обновление поверх): AutoPrintCode-X.Y.Z-Setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
-; Тихо и портативно: ... /VERYSILENT /PORTABLE=1 /DIR="E:\AutoPrintCode"
+;   (+ /CURRENTUSER — только для текущего пользователя; + /RELAUNCH=1 — запустить программу после установки)
+; Тихо и портативно: ... /VERYSILENT /CURRENTUSER /PORTABLE=1 /DIR="E:\AutoPrintCode"
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -47,14 +52,17 @@ AppUpdatesURL={#AppUrl}/releases
 VersionInfoVersion={#AppNumVersion}
 VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}
-DefaultDirName={localappdata}\Programs\{#AppName}
+DefaultDirName={autopf}\{#AppName}
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; папку спрашиваем сами: при обновлении страница пропускается (ShouldSkipPage)
 DisableDirPage=no
 UsePreviousAppDir=yes
 DirExistsWarning=no
-PrivilegesRequired=lowest
+; по умолчанию — для всех пользователей (Program Files); «только для меня» — без прав администратора
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=dialog commandline
+UsePreviousPrivileges=no
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
@@ -87,16 +95,20 @@ ru.ModeCaption=Как установить
 en.ModeCaption=How to install
 ru.ModeDescription=Обычная установка или портативная версия
 en.ModeDescription=Regular installation or portable copy
-ru.ModeText=Установка: AutoPrintCode появится в меню «Пуск», будет обновляться сам, удаляется через «Параметры → Приложения». Права администратора не нужны.%n%nПортативная версия: просто папка с программой — например, на флешке. В Windows ничего не прописывается; образцы и настройки хранятся в папке data рядом с программой.
-en.ModeText=Install: AutoPrintCode appears in the Start menu, updates itself and is removed via Settings → Apps. No administrator rights needed.%n%nPortable: just a folder with the program, e.g. on a USB stick. Nothing is registered in Windows; samples and settings live in the data folder next to the program.
+ru.ModeText=Установка: AutoPrintCode появится в меню «Пуск», будет обновляться сам, удаляется через «Параметры → Приложения».%n%nПортативная версия: просто папка с программой — например, на флешке. В Windows ничего не прописывается; образцы и настройки хранятся в папке data рядом с программой.
+en.ModeText=Install: AutoPrintCode appears in the Start menu, keeps itself up to date and is removed via Settings → Apps.%n%nPortable: just a folder with the program, e.g. on a USB stick. Nothing is registered in Windows; samples and settings live in the data folder next to the program.
+ru.ModeOldCopy=%n%nУ вас стоит копия «только для меня» (%1). Она будет удалена, а занятия и настройки программа перенесёт сама при первом запуске.
+en.ModeOldCopy=%n%nA per-user copy is installed (%1). It will be removed; lessons and settings are moved over on first launch.
 ru.ModeInstall=Установить (рекомендуется)
 en.ModeInstall=Install (recommended)
+ru.ModeInstallAll=Установить для всех пользователей — в Program Files (рекомендуется)
+en.ModeInstallAll=Install for all users — to Program Files (recommended)
 ru.ModeUpdate=Обновить установленную версию %1 → {#AppVersion}
 en.ModeUpdate=Update the installed version %1 → {#AppVersion}
 ru.ModePortable=Портативная версия — распаковать в папку
 en.ModePortable=Portable — unpack to a folder
-ru.NotWritable=В папку%n%n%1%n%nпрограмма не сможет записывать образцы, настройки и обновления (нужны права администратора).%n%nВыберите папку в своём профиле, например:%n%2
-en.NotWritable=AutoPrintCode will not be able to write samples, settings and updates to%n%n%1%n%n(administrator rights required).%n%nPlease choose a folder in your profile, for example:%n%2
+ru.NotWritable=В папку%n%n%1%n%nнет права записи (нужны права администратора).%n%nВыберите другую папку, например:%n%2
+en.NotWritable=No write access to%n%n%1%n%n(administrator rights required).%n%nPlease choose another folder, for example:%n%2
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Check: not IsPortable
@@ -114,7 +126,10 @@ Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{ap
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+; программа — от имени пользователя, даже если установщик работал с правами администратора
+Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchApp}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent runasoriginaluser
+; обновление из программы (тихо, /RELAUNCH=1): после установки запустить её снова
+Filename: "{app}\{#AppExe}"; Parameters: "--updated"; WorkingDir: "{app}"; Flags: nowait runasoriginaluser; Check: WantRelaunch
 
 [UninstallDelete]
 ; файлы, которые программа поставила сама при автообновлении (их нет в журнале установщика);
@@ -128,6 +143,8 @@ var
   Installed: Boolean;
   InstalledDir, InstalledVersion: String;
   AutoDir: String;   // папка, которую подставили сами (если человек её не менял — меняем при смене режима)
+  OldUserCopy: Boolean;   // установка для всех, а у пользователя стоит копия «только для меня» — удалить её
+  OldUserDir, OldUninstaller: String;
 
 function UninstallKey: String;
 begin
@@ -147,7 +164,22 @@ begin
   if Installed then
     Result := InstalledDir
   else
-    Result := ExpandConstant('{localappdata}\Programs\{#AppName}');
+    Result := ExpandConstant('{autopf}\{#AppName}');
+end;
+
+function WantRelaunch: Boolean;
+begin
+  Result := ExpandConstant('{param:relaunch|0}') = '1';
+end;
+
+// установка (запись в «Приложениях») в ветке реестра Root: есть и программа на месте → папка
+function FindInstall(Root: Integer; var Dir: String): Boolean;
+begin
+  Result := RegQueryStringValue(Root, UninstallKey, 'InstallLocation', Dir);
+  if Result then begin
+    Dir := RemoveBackslashUnlessRoot(Dir);
+    Result := FileExists(AddBackslash(Dir) + '{#AppExe}');   // запись осталась, а программы нет
+  end;
 end;
 
 function DefaultPortableDir: String;
@@ -157,23 +189,28 @@ end;
 
 procedure InitializeWizard;
 var
-  Line: String;
+  Line, Text: String;
+  Root: Integer;
 begin
-  Installed := RegQueryStringValue(HKCU, UninstallKey, 'InstallLocation', InstalledDir)
-    or RegQueryStringValue(HKLM, UninstallKey, 'InstallLocation', InstalledDir);
+  // своя установка — в той ветке реестра, куда ставим сейчас: для всех — HKLM, для себя — HKCU
+  if IsAdminInstallMode then Root := HKLM else Root := HKCU;
+  Installed := FindInstall(Root, InstalledDir);
   if Installed then begin
-    InstalledDir := RemoveBackslashUnlessRoot(InstalledDir);
-    Installed := FileExists(AddBackslash(InstalledDir) + '{#AppExe}');   // запись осталась, а программы нет
-  end;
-  if Installed then begin
-    if not RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', InstalledVersion) then
-      if not RegQueryStringValue(HKLM, UninstallKey, 'DisplayVersion', InstalledVersion) then
-        InstalledVersion := '';
+    if not RegQueryStringValue(Root, UninstallKey, 'DisplayVersion', InstalledVersion) then
+      InstalledVersion := '';
     Line := FmtMessage(CustomMessage('ModeUpdate'), [InstalledVersion]);
-  end else
+  end else if IsAdminInstallMode then
+    Line := CustomMessage('ModeInstallAll')
+  else
     Line := CustomMessage('ModeInstall');
+  Text := CustomMessage('ModeText');
+  // ставим для всех, а у пользователя есть копия «только для меня» — после установки она удаляется
+  OldUserCopy := IsAdminInstallMode and FindInstall(HKCU, OldUserDir)
+    and RegQueryStringValue(HKCU, UninstallKey, 'UninstallString', OldUninstaller);
+  if OldUserCopy then
+    Text := Text + FmtMessage(CustomMessage('ModeOldCopy'), [OldUserDir]);
   ModePage := CreateInputOptionPage(wpWelcome, CustomMessage('ModeCaption'), CustomMessage('ModeDescription'),
-    CustomMessage('ModeText'), True, False);
+    Text, True, False);
   ModePage.Add(Line);
   ModePage.Add(CustomMessage('ModePortable'));
   if ExpandConstant('{param:portable|0}') = '1' then
@@ -217,9 +254,31 @@ begin
     end;
   end else if CurPageID = wpSelectDir then begin
     if not DirWritable(WizardDirValue) then begin
-      if IsPortable then Want := DefaultPortableDir else Want := ExpandConstant('{localappdata}\Programs\{#AppName}');
+      if IsPortable then Want := DefaultPortableDir else Want := ExpandConstant('{autopf}\{#AppName}');
       MsgBox(FmtMessage(CustomMessage('NotWritable'), [WizardDirValue, Want]), mbError, MB_OK);
       Result := False;
+    end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Code, N: Integer;
+begin
+  // новая копия для всех поставлена — прежнюю «только для меня» убрать (её data\ остаётся: программа
+  // перенесёт занятия и настройки при первом запуске). Портативную установку это не касается
+  if (CurStep = ssPostInstall) and OldUserCopy and not IsPortable
+      and (CompareText(OldUserDir, RemoveBackslashUnlessRoot(ExpandConstant('{app}'))) <> 0) then begin
+    if not Exec(RemoveQuotes(OldUninstaller), '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART', '', SW_HIDE,
+        ewWaitUntilTerminated, Code) then
+      Log('Prior per-user copy was not removed: ' + SysErrorMessage(Code))
+    else begin
+      // программа перенесёт данные, только когда прежней копии уже нет — дождаться её удаления
+      N := 0;
+      while FileExists(AddBackslash(OldUserDir) + '{#AppExe}') and (N < 60) do begin
+        Sleep(500);
+        N := N + 1;
+      end;
     end;
   end;
 end;

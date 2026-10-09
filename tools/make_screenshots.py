@@ -149,6 +149,14 @@ def main() -> int:
     win._on_mode("steps")
     win._set_step_pointer(steps_t.code_blocks()[0].id, 3)
     shot(win, "steps")
+    # суфлёр в отдельном окне: тот же шаг — что сказать, код и куда его вставить
+    win.prompter_ctl.show()
+    pw = win.prompter_ctl.window
+    pw.resize(470, 400)
+    win.prompter_ctl.refresh()
+    shot(pw, "prompter-window")
+    pw.close()
+    s.prompter_window = False
     win.strip.sw_strip.setChecked(False)
     win._on_mode("lines")
     win.open_template(tour.id)

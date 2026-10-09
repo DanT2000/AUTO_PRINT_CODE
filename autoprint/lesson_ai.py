@@ -21,6 +21,14 @@
 }
 "lines" — строки итогового файла по порядку, у каждой номер шага, на котором она появляется: шаг может
 дописать строки выше уже напечатанных (import в начало). Так число строк и шагов не может разойтись.
+
+Большой код (is_big) — «разметка» (Options.marks): переписывать сотни строк нейросеть будет долго и упрётся
+в предел длины ответа. Поэтому строки материала нумеруются, а нейросеть отвечает только разметкой —
+какие строки на каком шаге и что сказать перед ними; код программа берёт из материала, он остаётся точно
+вашим:
+{"format": "autoprintcode-lesson", "version": 1, "mode": "marks", "title": "…", "lang": "python",
+ "intro": [{"type": "task", "text": "…"}],
+ "marks": [{"from": 1, "to": 12, "step": 1, "say": "что сказать перед этими строками"}, …]}
 """
 from __future__ import annotations
 
@@ -29,7 +37,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
-from .comments import strip_comments
+from .comments import comment_line, comment_spans, strip_comments, supported
+from .importers import guess_lang
 from .storage import BLOCK_CODE, BLOCK_MARKDOWN, ROLES, Block, Template
 
 FORMAT = "autoprintcode-lesson"
@@ -42,6 +51,10 @@ STYLES = {
 }
 DETAIL_SHORT, DETAIL_FULL = "short", "full"
 
+# код больше — разбор «разметкой»: нейросеть не переписывает код, а размечает строки
+BIG_LINES = 120
+BIG_CHARS = 6000
+
 
 @dataclass
 class Options:
@@ -51,6 +64,19 @@ class Options:
     keep_code: bool = True       # код не менять — только комментарии и разметка
     detail: str = DETAIL_SHORT   # комментарии: коротко | подробно
     lang: str = ""               # язык кода, если известен ("" — пусть определит нейросеть)
+    marks: bool = False          # большой код: ответ — разметка строк, код берётся из материала
+
+
+def source_lines(material: str) -> list[str]:
+    """Строки материала так, как они пронумерованы для нейросети (с 1)."""
+    text = material.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    return [ln.rstrip() for ln in text.split("\n")]
+
+
+def is_big(material: str) -> bool:
+    """Код такой длины разбирать «разметкой»."""
+    src = source_lines(material)
+    return len(src) > BIG_LINES or sum(len(x) for x in src) > BIG_CHARS
 
 
 # ---------------------------------------------------------------- промпт
@@ -78,17 +104,26 @@ _STYLE_RULES = {
 
 def build_prompt(material: str, opt: Options) -> str:
     """Промпт целиком для «Скопировать промпт»: правила, формат, пример — и материал пользователя в конце."""
-    return instruction(opt) + material_message(material)
+    return instruction(opt) + material_message(material, opt.marks)
 
 
-def material_message(material: str) -> str:
+def material_message(material: str, numbered: bool = False) -> str:
+    if numbered:
+        body = "\n".join(f"{i}| {ln}" for i, ln in enumerate(source_lines(material), 1))
+        return (f"\nМАТЕРИАЛ — строки пронумерованы («номер| текст»; номер и «| » — не часть кода):\n"
+                f"<<<\n{body}\n>>>\n")
     return f"\nМАТЕРИАЛ (код или задание с решением):\n<<<\n{material.strip()}\n>>>\n"
 
 
 def instruction(opt: Options) -> str:
     """Правила, формат и пример — без материала (по API это системное сообщение, материал — отдельным)."""
-    keep = ("Код НЕ МЕНЯЙ: ни имён, ни логики, ни порядка, ни форматирования — только добавь комментарии "
-            "(и разметку шагов/частей). Если в материале есть условие задачи — его не переписывай в код."
+    if opt.marks:
+        return _marks_instruction(opt)
+    keep = ("Код НЕ МЕНЯЙ: ни имён, ни логики, ни ПОРЯДКА строк, ни форматирования — только добавь комментарии "
+            "(и разметку шагов/частей). Строки кода в ответе идут ровно в том порядке, что и в исходном файле; "
+            "в разборе по шагам порядок итогового файла тоже исходный — меняются только номера шагов "
+            "(например, import стоит первой строкой, но с номером позднего шага). Если в материале есть "
+            "условие задачи — его не переписывай в код."
             if opt.keep_code else
             "Код можно поправить, если в нём ошибка или он явно неудобен для объяснения новичкам, — но "
             "без лишнего усложнения.")
@@ -105,11 +140,7 @@ def instruction(opt: Options) -> str:
         extra.append('Блоков "explain" не добавляй.')
     lang = f'Язык кода: {opt.lang}.' if opt.lang else 'Язык кода определи сам ("lang": python, javascript, …).'
     example = _EXAMPLES[opt.style]
-    return f"""Ты помогаешь преподавателю программирования подготовить занятие для программы AutoPrintCode.
-Программа сама «печатает» код в редактор во время урока, а преподаватель в это время объясняет.
-Комментарии в коде — это подсказки преподавателю: программа может не печатать их, а показывать
-на суфлёре — что сказать перед следующим куском. Пиши комментарии на русском, как живую речь
-преподавателя, обращаясь к ученикам («сейчас заведём…», «обратите внимание…»).
+    return f"""{_INTRO}
 
 {_STYLE_RULES[opt.style]}
 
@@ -130,6 +161,98 @@ def instruction(opt: Options) -> str:
 
 Пример ответа (по смыслу, не копируй):
 {example}
+"""
+
+
+_INTRO = """Ты помогаешь преподавателю программирования подготовить занятие для программы AutoPrintCode.
+Программа сама «печатает» код в редактор во время урока, а преподаватель в это время объясняет.
+Комментарии в коде — это подсказки преподавателю: программа может не печатать их, а показывать
+на суфлёре — что сказать перед следующим куском. Пиши комментарии на русском, как живую речь
+преподавателя, обращаясь к ученикам («сейчас заведём…», «обратите внимание…»). Не начинай комментарии
+со слов «Шаг 1:», «Часть 2:» — программа сама показывает номер шага."""
+
+_MARKS_RULES = {
+    STYLE_COMMENTS: """\
+"marks" — смысловые куски кода по порядку (функция, цикл, подготовка данных — обычно 3–20 строк):
+"from" и "to" — номера первой и последней строки куска, "say" — комментарий для преподавателя, что
+сказать перед этим куском (программа вставит его строкой-комментарием над куском). "step" не нужен.""",
+    STYLE_STEPS: """\
+"marks" — разбор ПО ШАГАМ, как преподаватель пишет программу у доски: сначала простое и данные, потом
+обработка, потом вывод. Каждая метка — диапазон строк "from"–"to" и номер шага "step", на котором эти
+строки появляются. Шаг может дописывать строки ВЫШЕ уже написанного: например, import в строке 1
+понадобился на шаге 3 — метка {"from": 1, "to": 1, "step": 3}. У шага может быть несколько меток
+(одинаковый "step"). "say" — что сказать перед шагом (у первой метки шага; у остальных — "").
+Для большого кода шагов обычно 6–25, в шаге — 3–30 строк.""",
+    STYLE_PARTS: """\
+"marks" — ЧАСТИ программы по порядку (обычно 4–12): "from"–"to" — строки части, "say" — пояснение
+для учеников, что делаем в этой части (1–3 предложения). Программа сделает из каждой части пояснение
+и блок кода.""",
+}
+
+_MARKS_EXAMPLES = {
+    STYLE_COMMENTS: """{"format": "autoprintcode-lesson", "version": 1, "mode": "marks", "title": "Оценки", "lang": "python",
+ "intro": [{"type": "task", "text": "## Средний балл\\nПосчитать средний балл и медиану."}],
+ "marks": [
+  {"from": 1, "to": 2, "say": "Подключаем модуль statistics — в нём есть медиана"},
+  {"from": 3, "to": 3, "say": "Заводим список оценок"},
+  {"from": 4, "to": 5, "say": "Средний балл и медиана"}
+ ]}""",
+    STYLE_STEPS: """{"format": "autoprintcode-lesson", "version": 1, "mode": "marks", "title": "Оценки", "lang": "python",
+ "intro": [{"type": "explain", "text": "Посчитаем средний балл и медиану."}],
+ "marks": [
+  {"from": 3, "to": 3, "step": 1, "say": "Сначала — сами оценки"},
+  {"from": 4, "to": 4, "step": 2, "say": "Средний балл: сумму делим на количество"},
+  {"from": 1, "to": 2, "step": 3, "say": "Медиану возьмём из модуля statistics — допишем import наверх"},
+  {"from": 5, "to": 5, "step": 3, "say": ""}
+ ]}""",
+    STYLE_PARTS: """{"format": "autoprintcode-lesson", "version": 1, "mode": "marks", "title": "Оценки", "lang": "python",
+ "intro": [],
+ "marks": [
+  {"from": 1, "to": 3, "say": "Подключим модуль и заведём список оценок."},
+  {"from": 4, "to": 5, "say": "Посчитаем средний балл и медиану."}
+ ]}""",
+}
+
+
+def _marks_instruction(opt: Options) -> str:
+    """Промпт «разметки» для большого кода: код не переписывать — только номера строк, шаги и комментарии."""
+    detail = ('Комментарии ("say") короткие: одна строка, по сути, разговорным языком.'
+              if opt.detail == DETAIL_SHORT else
+              'Комментарии ("say") подробные: 1–3 предложения, объясняй «зачем», а не только «что».')
+    intro = []
+    if opt.task:
+        intro.append('"intro" начинается с краткого условия задачи ("type": "task", Markdown: заголовок «## …» '
+                     'и 1–4 строки). Если условия в материале нет — сформулируй его по коду.')
+    if opt.explain and opt.style != STYLE_PARTS:
+        intro.append('В "intro" — блок "explain": 1–3 предложения для учеников, что будем делать.')
+    if not intro:
+        intro.append('"intro" — пустой список.')
+    lang = f'Язык кода: {opt.lang}.' if opt.lang else 'Язык кода определи сам ("lang": python, javascript, …).'
+    return f"""{_INTRO}
+
+Код большой, поэтому НЕ ПЕРЕПИСЫВАЙ его в ответ — программа возьмёт его из материала сама, без изменений.
+Строки материала пронумерованы. Ответь РАЗМЕТКОЙ: какие строки куда относятся и что сказать перед ними.
+
+{_MARKS_RULES[opt.style]}
+
+Метки не пересекаются и вместе покрывают весь код — с первой строки кода до последней, включая
+docstring, комментарии, импорты и пустые строки. Не включай только то, что не код: условие задачи или
+пояснения, если они есть в материале отдельным текстом. Номера — ровно те, что стоят в материале слева.
+{detail}
+{lang}
+{chr(10).join(intro)}
+
+ОТВЕТ — ТОЛЬКО JSON, без пояснений до и после, по формату:
+{{
+  "format": "{FORMAT}", "version": 1, "mode": "marks",
+  "title": "короткое название занятия", "lang": "язык кода",
+  "intro": [ {{"type": "task" | "explain", "text": "Markdown"}} ],
+  "marks": [ {{"from": номер, "to": номер, "step": номер_шага, "say": "что сказать"}}, … ]
+}}
+
+Пример ответа (по смыслу, не копируй; материал примера — 5 строк: import, пустая, список оценок,
+средний балл, медиана):
+{_MARKS_EXAMPLES[opt.style]}
 """
 
 
@@ -206,7 +329,8 @@ def extract_json(text: str):
 
 def is_lesson_json(text: str) -> bool:
     data = extract_json(text)
-    return isinstance(data, dict) and (data.get("format") == FORMAT or isinstance(data.get("blocks"), list))
+    return isinstance(data, dict) and (data.get("format") == FORMAT or isinstance(data.get("blocks"), list)
+                                       or isinstance(data.get("marks"), list))
 
 
 def _compact_steps(steps: list[int]) -> list[int]:
@@ -238,14 +362,17 @@ def _lines(raw, n_block: int, warnings: list[str]) -> tuple[str, list[int]]:
     return "\n".join(texts), compact
 
 
-def parse_lesson(text: str, title: str = "") -> Parsed:
-    """Ответ нейросети (или наш JSON) → занятие. LessonError — если разобрать нельзя."""
+def parse_lesson(text: str, title: str = "", material: str = "", style: str = "") -> Parsed:
+    """Ответ нейросети (или наш JSON) → занятие. LessonError — если разобрать нельзя.
+    material и style нужны «разметке» большого кода: код берётся из материала."""
     data = extract_json(text)
     if data is None:
         raise LessonError("В ответе не нашёлся JSON. Попросите нейросеть ответить строго в формате из промпта "
                           "(без пояснений), или вставьте код во вкладке «Вставить».")
     if isinstance(data, dict) and isinstance(data.get("autoprintcode_template"), dict):
         data = data["autoprintcode_template"]          # наш экспорт занятия в .json
+    if isinstance(data, dict) and (data.get("mode") == "marks" or isinstance(data.get("marks"), list)):
+        return _parse_marks(data, material, style, title)
     if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
         raise LessonError("В JSON нет списка блоков (\"blocks\").")
     warnings: list[str] = []
@@ -288,6 +415,183 @@ def parse_lesson(text: str, title: str = "") -> Parsed:
     return Parsed(t, warnings)
 
 
+# ---------------------------------------------------------------- разметка большого кода
+
+_FENCE = re.compile(r"^\s*```")
+_SKIP = -1
+# начало строки, с которого начинается код, а не текст задачи
+_CODE_HEAD = re.compile(r'("""|\'\'\'|#|//|/\*|--|<|@|import\b|from\s+\S+\s+import\b|def\b|class\b|package\b|using\b|'
+                        r'const\b|let\b|var\b|function\b|public\b|int\b|void\b|fn\b|func\b|[\w.]+\s*=[^=]|\w+\()')
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _text_blocks(raw_list) -> list[Block]:
+    out = []
+    for raw in raw_list or []:
+        if isinstance(raw, str):
+            raw = {"type": "text", "text": raw}
+        if not isinstance(raw, dict):
+            continue
+        role = _TYPE_ROLE.get(str(raw.get("type", "")).lower(), "text")
+        body = str(raw.get("text") or "").replace("\r\n", "\n").strip()
+        if body:
+            out.append(Block(BLOCK_MARKDOWN, body, role=role if role in ROLES else "text"))
+    return out
+
+
+def _read_marks(raw_marks: list, n: int, warnings: list[str]) -> list[dict]:
+    marks, bad = [], 0
+    for m in raw_marks:
+        if not isinstance(m, dict):
+            bad += 1
+            continue
+        a = _int(m.get("from", m.get("start", m.get("line"))))
+        b = _int(m.get("to", m.get("end")))
+        if isinstance(m.get("lines"), list) and len(m["lines"]) == 2:
+            a, b = _int(m["lines"][0]), _int(m["lines"][1])
+        if a is None:
+            bad += 1
+            continue
+        b = a if b is None else b
+        if b < a:
+            a, b = b, a
+        if b < 1 or a > n:
+            bad += 1
+            continue
+        say = m.get("say", m.get("comment", m.get("text", "")))
+        marks.append({"from": max(1, a), "to": min(n, b), "step": _int(m.get("step")),
+                      "say": str(say or "").replace("\r", "").strip()})
+    if bad:
+        warnings.append(f"Меток не разобрано: {bad} (нет номеров строк или они вне кода).")
+    return sorted(marks, key=lambda m: (m["from"], m["to"]))
+
+
+def _drop_broken_comments(lines: list[tuple[int, str, bool]], lang: str,
+                          warnings: list[str]) -> list[tuple[int, str, bool]]:
+    """Вставленный комментарий должен остаться комментарием: метка, начатая внутри многострочной строки
+    (docstring, шаблон), испортила бы её — такой комментарий убираем."""
+    if not supported(lang):
+        return lines   # язык без разбора комментариев — проверить нечем
+    text = "\n".join(tx for _st, tx, _c in lines)
+    starts, pos = [], 0
+    for _st, tx, _c in lines:
+        starts.append(pos)
+        pos += len(tx) + 1
+    spans = {a for a, _b in comment_spans(text, lang)}
+    keep, bad = [], 0
+    for (st, tx, ins), at in zip(lines, starts):
+        if ins and at + len(tx) - len(tx.lstrip()) not in spans:
+            bad += 1
+            continue
+        keep.append((st, tx, ins))
+    if bad:
+        warnings.append(f"Комментариев убрано: {bad} — они попали бы внутрь многострочной строки кода.")
+    return keep
+
+
+def _parse_marks(data: dict, material: str, style: str, title: str) -> Parsed:
+    """«Разметка» большого кода → занятие: код — из материала, от нейросети только шаги и комментарии."""
+    src = source_lines(material) if material.strip() else []
+    if not src:
+        raise LessonError("Это разметка без кода (ответ для большого кода): разбирать её нужно вместе с кодом — "
+                          "вставьте ответ во вкладке «С помощью нейросети», где вставлен ваш код.")
+    if not isinstance(data.get("marks"), list) or not data["marks"]:
+        raise LessonError('В разметке нет меток ("marks") — попросите нейросеть ответить по формату из промпта.')
+    warnings: list[str] = []
+    n = len(src)
+    marks = _read_marks(data["marks"], n, warnings)
+    if not marks:
+        raise LessonError("В разметке нет ни одной метки с номерами строк.")
+    if not style:
+        style = STYLE_STEPS if any(m["step"] for m in marks) else STYLE_COMMENTS
+    # чья каждая строка: первой метки, что её покрывает; строки между метками и после — соседней сверху
+    owner: list[int | None] = [None] * (n + 1)
+    for i, m in enumerate(marks):
+        for ln in range(m["from"], m["to"] + 1):
+            if owner[ln] is None:
+                owner[ln] = i
+    first = marks[0]["from"]
+    unmarked = 0
+    for ln in range(1, n + 1):
+        if _FENCE.match(src[ln - 1]):
+            owner[ln] = _SKIP     # ``` из Markdown — не код
+        elif owner[ln] is None and ln > first:
+            owner[ln] = next((owner[k] for k in range(ln - 1, 0, -1) if owner[k] not in (None, _SKIP)), None)
+            if src[ln - 1].strip():
+                unmarked += 1
+    lead = [x.strip() for x in src[:first - 1] if x.strip() and not _FENCE.match(x)]
+    if lead and _CODE_HEAD.match(lead[0]):
+        # нейросеть не разметила начало файла (docstring, комментарий, import) — это код: к первой метке
+        for ln in range(1, first):
+            if owner[ln] is None:
+                owner[ln] = owner[first]
+                unmarked += 1 if src[ln - 1].strip() else 0
+    elif lead:
+        warnings.append(f"Строки 1–{first - 1} не вошли в код — похоже на условие задачи: «{lead[0][:60]}»…")
+    if unmarked:
+        warnings.append(f"Строк без разметки: {unmarked} — добавлены к соседнему куску.")
+    last = 1
+    for m in marks:   # шаг не указан — как у предыдущей метки
+        m["step"] = max(1, m["step"]) if m["step"] else last
+        last = m["step"]
+    lang = str(data.get("lang") or "").lower().strip() or guess_lang("\n".join(src))
+    blocks = _text_blocks(data.get("intro"))
+    if style == STYLE_PARTS:
+        parts: list[tuple[int, list[str]]] = []
+        for ln in range(1, n + 1):
+            o = owner[ln]
+            if o is None or o == _SKIP:
+                continue
+            if not parts or parts[-1][0] != o:
+                parts.append((o, []))
+            parts[-1][1].append(src[ln - 1])
+        for o, rows in parts:
+            while rows and not rows[0].strip():
+                rows.pop(0)
+            while rows and not rows[-1].strip():
+                rows.pop()
+            if rows:
+                if marks[o]["say"]:
+                    blocks.append(Block(BLOCK_MARKDOWN, marks[o]["say"], role="explain"))
+                blocks.append(Block(BLOCK_CODE, "\n".join(rows), lang=lang))
+    else:
+        lines: list[tuple[int, str, bool]] = []      # (шаг, строка, это вставленный комментарий)
+        said: set[int] = set()
+        for ln in range(1, n + 1):
+            o = owner[ln]
+            if o is None or o == _SKIP:
+                continue
+            m, line = marks[o], src[ln - 1]
+            if o not in said and line.strip():
+                # комментарий-подсказка — строкой над первой строкой куска, с её отступом
+                said.add(o)
+                indent = line[:len(line) - len(line.lstrip())]
+                for part in m["say"].split("\n"):
+                    if part.strip():
+                        lines.append((m["step"], indent + comment_line(part.strip(), lang), True))
+            lines.append((m["step"], line, False))
+        lines = _drop_broken_comments(lines, lang, warnings)
+        while lines and not lines[-1][1].strip():
+            lines.pop()
+        while lines and not lines[0][1].strip():
+            lines.pop(0)
+        if lines:
+            steps = _compact_steps([st for st, _tx, _c in lines]) if style == STYLE_STEPS else []
+            blocks.append(Block(BLOCK_CODE, "\n".join(tx for _st, tx, _c in lines), lang=lang, steps=steps))
+    if not any(b.type == BLOCK_CODE for b in blocks):
+        raise LessonError("По разметке не набралось ни одной строки кода.")
+    name = str(data.get("title") or title or "Новое занятие").strip()[:120]
+    t = Template(title=name, blocks=blocks)
+    t.active_block = next(b.id for b in blocks if b.type == BLOCK_CODE)
+    return Parsed(t, warnings)
+
+
 def _norm_code(text: str, lang: str) -> list[str]:
     """Код без комментариев и пустых строк, без хвостовых пробелов — для сравнения «код не меняли»."""
     bare = strip_comments(text, lang)[0]
@@ -302,11 +606,20 @@ def code_changes(original: str, parsed: Parsed) -> list[str]:
     lang = codes[0].lang
     got = [ln for b in codes for ln in _norm_code(b.text, b.lang)]
     want = _norm_code(original, lang)
-    if got == want:
-        return []
-    # в материале могло быть условие задачи — сравниваем только строки, похожие на код из ответа
-    if set(got) <= set(want):
-        return []
+    if got == want or _subsequence(got, want):
+        return []   # в материале могло быть ещё условие задачи — его строк в коде нет, порядок кода тот же
+    if sorted(got) == sorted(want) or (set(got) <= set(want) and len(got) == len(set(got))):
+        # те же строки в другом порядке: переставленные — те, что не входят в общую последовательность
+        sm = difflib.SequenceMatcher(a=want, b=got, autojunk=False)
+        kept = {i for blk in sm.get_matching_blocks() for i in range(blk.b, blk.b + blk.size)}
+        moved = [got[i] for i in range(len(got)) if i not in kept]
+        return [f"строка переставлена: {ln.strip()}" for ln in moved[:6]]
     diff = [ln for ln in difflib.unified_diff(want, got, lineterm="", n=0) if ln[:1] in "+-"
             and not ln.startswith(("+++", "---"))]
     return diff[:12]
+
+
+def _subsequence(small: list[str], big: list[str]) -> bool:
+    """Все строки small встречаются в big в том же порядке (между ними могут быть лишние)."""
+    it = iter(big)
+    return all(any(x == y for y in it) for x in small)

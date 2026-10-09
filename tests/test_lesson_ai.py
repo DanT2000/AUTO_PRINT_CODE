@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import textwrap
 import threading
 from pathlib import Path
 
@@ -117,6 +118,8 @@ class Fake(http.server.BaseHTTPRequestHandler):
     calls: list[dict] = []
     reject_json_mode = False
     fail = False
+    sse = False
+    cut = False
 
     def log_message(self, *a) -> None:
         pass
@@ -141,6 +144,19 @@ class Fake(http.server.BaseHTTPRequestHandler):
         if Fake.reject_json_mode and "response_format" in req:
             return self._send(400, {"error": {"message": "response_format unsupported"}})
         content = "<think>размышляю</think>" + L._EXAMPLES[L.STYLE_COMMENTS]
+        if Fake.cut:
+            return self._send(200, {"choices": [{"message": {"content": content[:50]}, "finish_reason": "length"}]})
+        if req.get("stream") and Fake.sse:
+            # поток, как у настоящих серверов: рассуждения, затем ответ кусками
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            chunks = [{"reasoning_content": "думаю"}] + [{"content": content[i:i + 40]}
+                                                          for i in range(0, len(content), 40)]
+            for d in chunks:
+                self.wfile.write(b"data: " + json.dumps({"choices": [{"delta": d}]}).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         self._send(200, {"choices": [{"message": {"content": content}}]})
 
 
@@ -169,6 +185,22 @@ def test_ai() -> None:
     check("сервер не понял response_format (400) — повтор без него", len(Fake.calls) == n + 2
           and "response_format" not in Fake.calls[-1] and text)
     Fake.reject_json_mode = False
+    Fake.sse = True
+    seen: list[tuple] = []
+    text, _ = ai.ask(s, "sys", "user", on_progress=lambda ph, n, tail: seen.append((ph, n)))
+    Fake.sse = False
+    phases = [ph for ph, _n in seen]
+    check("поток (SSE): ответ собран, ход виден — думает, затем пишет",
+          L.parse_lesson(text).template.code_blocks() and "think" in phases and "write" in phases
+          and phases.index("think") < phases.index("write") and seen[-1][1] == len(text) + len("<think>размышляю</think>"),
+          f"{len(seen)} событий")
+    Fake.cut = True
+    try:
+        ai.ask(s, "sys", "user")
+        check("ответ оборвался — ошибка", False)
+    except ai.AIError as e:
+        check("ответ оборвался на пределе длины — так и сказано", "оборвался" in str(e), str(e)[:70])
+    Fake.cut = False
     check("список моделей — без эмбеддингов и whisper", ai.list_models(ai.config(s)) == ["coder-7b"])
     ms, sample = ai.check(ai.config(s))
     check("проверка связи — время и ответ", ms >= 0 and bool(sample), f"{ms} мс")
@@ -179,6 +211,13 @@ def test_ai() -> None:
     statuses: list[str] = []
     text, who = ai.ask(s, "sys", "user", on_status=statuses.append)
     check("основной не ответил — ответил запасной", "Своё" in who and len(statuses) == 2, who)
+    s.ai_backup_provider = "deepseek"   # запасная без ключа — не пробовать, сказать почему
+    try:
+        ai.ask(s, "sys", "user")
+        check("запасная без ключа — ошибка", False)
+    except ai.AIError as e:
+        check("запасная не настроена — не пробуем, причина в ошибке", "Запасная (DeepSeek) не настроена" in str(e),
+              str(e)[-70:])
     s.ai_backup_enabled = False
     try:
         ai.ask(s, "sys", "user")
@@ -199,22 +238,63 @@ def test_ai() -> None:
 
 
 def test_cli() -> None:
-    """Агент по подписке: запрос уходит в stdin, ответ — из stdout; отмена убивает процесс."""
+    """Агент по подписке: «голый» запуск, системный промпт — файлом, материал — в stdin, ход — потоком событий;
+    отмена убивает процесс."""
     d = Path(tempfile.mkdtemp(prefix="autoprint-fakecli-"))
     script = d / "fake.py"
-    script.write_text("import sys, time, json\nsrc = sys.stdin.read()\n"
-                      "if 'SLOW' in src: time.sleep(30)\n"
-                      "print(json.dumps({'blocks': [{'type': 'code', 'code': 'got ' + str(len(src))}]}))\n",
-                      encoding="utf-8")
+    # как claude -p --output-format stream-json: думает, пишет ответ кусками, в конце — result
+    script.write_text(textwrap.dedent("""\
+        import sys, time, json, os
+        args = sys.argv[1:]
+        src = sys.stdin.read()
+        sysp = open(args[args.index("--system-prompt-file") + 1], encoding="utf-8").read()
+        json.dump({"args": args, "cwd": os.getcwd(), "system": sysp, "stdin": src},
+                  open(os.environ["FAKE_LOG"], "w", encoding="utf-8"))
+        if "SLOW" in src:
+            time.sleep(30)
+        if "FAIL" in src:
+            print(json.dumps({"type": "result", "is_error": True, "result": "Not logged in"}))
+            sys.exit(1)
+        out = json.dumps({"blocks": [{"type": "code", "code": "got " + str(len(src))}]})
+        def ev(o):
+            print(json.dumps(o), flush=True)
+        ev({"type": "system", "subtype": "init"})
+        ev({"type": "system", "subtype": "thinking_tokens", "estimated_tokens": 120})
+        for i in range(0, len(out), 10):
+            ev({"type": "stream_event", "event": {"type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": out[i:i + 10]}}})
+        ev({"type": "result", "subtype": "success", "is_error": False, "result": out})
+        """), encoding="utf-8")
+    log = d / "call.json"
+    os.environ["FAKE_LOG"] = str(log)
     cmd = d / "claude.cmd"
-    cmd.write_text(f'@echo off\r\n"{sys.executable}" "{script}"\r\n', encoding="utf-8")
+    cmd.write_text(f'@echo off\r\n"{sys.executable}" "{script}" %*\r\n', encoding="utf-8")
     real = ai.cli_path
     ai.cli_path = lambda p: str(cmd)
     try:
         s = Settings()
         s.ai_provider = "claudeCli"
-        text, who = ai.ask(s, "sys", "user")
-        check("агент по подписке: ответ из stdout", "got" in text and "Claude" in who, text[:60])
+        seen: list[tuple] = []
+        text, who = ai.ask(s, "СИСТЕМНЫЙ", "МАТЕРИАЛ", on_progress=lambda ph, n, tail: seen.append((ph, n)))
+        call = json.loads(log.read_text(encoding="utf-8"))
+        args = call["args"]
+        check("агент по подписке: ответ из потока событий", "got" in text and "Claude" in who, text[:60])
+        check("ход работы виден: подключение → думает → пишет",
+              [ph for ph, _ in seen][:2] == ["connect", "think"] and seen[-1][0] == "write", str(seen[:3]))
+        check("«голый» запуск: без инструментов, MCP и настроек, модель sonnet",
+              "--tools" in args and args[args.index("--tools") + 1] == "" and "--strict-mcp-config" in args
+              and "--setting-sources" in args and args[args.index("--model") + 1] == "sonnet", " ".join(args)[:120])
+        check("системный промпт — файлом, материал — в stdin, папка пустая",
+              "СИСТЕМНЫЙ" in call["system"] and call["stdin"] == "МАТЕРИАЛ" and "AutoPrintCode-ai" in call["cwd"])
+        s.ai_models = {"claudeCli": ""}
+        ai.ask(s, "sys", "user")
+        check("модель «как в Claude Code» — без --model",
+              "--model" not in json.loads(log.read_text(encoding="utf-8"))["args"])
+        try:
+            ai.ask(s, "sys", "FAIL")
+            check("вход истёк — ошибка", False)
+        except ai.AIError as e:
+            check("вход истёк — понятная подсказка", "войдите" in str(e), str(e)[:80])
         ev = threading.Event()
         threading.Timer(1.0, ev.set).start()
         import time
@@ -227,12 +307,67 @@ def test_cli() -> None:
                   f"{time.monotonic() - t0:.1f} с")
     finally:
         ai.cli_path = real
+    check("модели агентов: готовый список, «как в программе» — первым",
+          ai.provider("codexCli").models[0][0] == "" and len(ai.provider("codexCli").models) >= 3
+          and ai.list_models(ai.config(Settings(), "codexCli"))[0] == "")
+
+
+def test_marks() -> None:
+    """Большой код: нейросеть отвечает разметкой строк, код берётся из материала без изменений."""
+    big = "\n".join(f"x{i} = {i}" for i in range(L.BIG_LINES + 5))
+    check("большой код — разбор разметкой", L.is_big(big) and not L.is_big(CODE))
+    opt = L.Options(style=L.STYLE_STEPS, marks=True)
+    prompt = L.build_prompt(CODE, opt)
+    check("промпт разметки: строки пронумерованы, код не переписывать, пример",
+          "1| import statistics" in prompt and "НЕ ПЕРЕПИСЫВАЙ" in prompt and '"marks"' in prompt
+          and '"lines"' not in prompt)
+    exp_steps = [3, 3, 3, 1, 1, 2, 2, 3]   # import наверху с шагом 3, его комментарий тоже
+    for style in L.STYLES:
+        ans = L._MARKS_EXAMPLES[style]
+        p = L.parse_lesson(ans, material=CODE, style=style)
+        codes = p.template.code_blocks()
+        ok = not L.code_changes(CODE, p) and not p.warnings
+        if style == L.STYLE_STEPS:
+            ok = ok and codes[0].steps == exp_steps and codes[0].text.startswith("# Медиану")
+        if style == L.STYLE_PARTS:
+            ok = ok and len(codes) == 2 and p.template.blocks[0].role == "explain"
+        if style == L.STYLE_COMMENTS:
+            ok = ok and codes[0].steps == [] and codes[0].text.count("# ") == 3
+        check(f"разметка «{L.STYLES[style]}»: код из материала, комментарии на месте", ok,
+              f"{p.summary} {p.warnings}")
+    # начало файла нейросеть не разметила: docstring — код, условие задачи — нет
+    doc = '"""Модуль оценок."""\nimport statistics\n\ngrades = [5, 4]'
+    p = L.parse_lesson('{"mode": "marks", "marks": [{"from": 2, "to": 4, "step": 1, "say": "Начнём"}]}',
+                       material=doc, style=L.STYLE_STEPS)
+    check("неразмеченный docstring в начале — остаётся в коде", not L.code_changes(doc, p)
+          and p.template.code_blocks()[0].text.startswith("# Начнём\n\"\"\"Модуль"), p.template.code_blocks()[0].text)
+    task = "Задача: посчитать среднее.\n\n```python\nimport statistics\ngrades = [5, 4]\n```"
+    p = L.parse_lesson('{"mode": "marks", "marks": [{"from": 4, "to": 5, "say": "Код"}]}', material=task,
+                       style=L.STYLE_COMMENTS)
+    check("условие задачи перед кодом и ``` — не код", p.template.code_blocks()[0].text
+          == "# Код\nimport statistics\ngrades = [5, 4]" and any("условие" in w for w in p.warnings), str(p.warnings))
+    inside = 'def f():\n    """Длинное\n    описание."""\n    return 1'
+    p = L.parse_lesson('{"mode": "marks", "marks": [{"from": 1, "to": 2, "say": "Функция"},'
+                       ' {"from": 3, "to": 4, "say": "Внутри строки"}]}', material=inside, style=L.STYLE_COMMENTS)
+    text = p.template.code_blocks()[0].text
+    check("комментарий внутри многострочной строки не вставляется", "Внутри строки" not in text
+          and "# Функция" in text and any("многострочной" in w for w in p.warnings), text)
+    js = "const a = 1;\nconsole.log(a);"
+    p = L.parse_lesson('{"mode": "marks", "lang": "javascript", "marks": [{"from": 1, "to": 2, "say": "Выводим"}]}',
+                       material=js)
+    check("JavaScript: комментарий через //", p.template.code_blocks()[0].text.startswith("// Выводим\n"))
+    try:
+        L.parse_lesson('{"mode": "marks", "marks": [{"from": 1, "to": 2}]}')
+        check("разметка без кода — ошибка", False)
+    except L.LessonError as e:
+        check("разметка без материала — понятная ошибка", "вместе с кодом" in str(e))
 
 
 def main() -> int:
     test_prompt()
     test_parse()
     test_code_changes()
+    test_marks()
     test_pasted()
     test_ai()
     test_cli()

@@ -33,7 +33,7 @@ def _hook(t, v, tb) -> None:
 
 sys.excepthook = _hook
 
-from autoprint import lesson_ai as L  # noqa: E402
+from autoprint import ai, lesson_ai as L  # noqa: E402
 from autoprint.storage import Settings, TemplateStore  # noqa: E402
 from autoprint.ui.main_window import MainWindow  # noqa: E402
 from autoprint.ui.theme import theme  # noqa: E402
@@ -147,6 +147,28 @@ def main() -> int:
           and any(len(set(b.steps)) > 1 for b in t.code_blocks()), f"{win.settings.print_mode}")
     check("выбор разбора запомнен в настройках", win.settings.lesson_style == L.STYLE_STEPS)
 
+    # --- большой код: нейросеть только размечает строки, код берётся из материала
+    win.import_files("ai")
+    d = win._import_dlg
+    pump()
+    big = "\n".join(f"value_{i} = compute({i})" for i in range(L.BIG_LINES + 30))
+    d.material.setPlainText(big)
+    d._update_ai_buttons()
+    d.copy_btn.click()
+    clip = QGuiApplication.clipboard().text()
+    check("большой код: подсказка «разметит строки», промпт — разметкой с номерами строк",
+          "разметит" in d.ai_info.text() and "1| value_0" in clip and "НЕ ПЕРЕПИСЫВАЙ" in clip, d.ai_info.text()[:90])
+    d.answer_edit.setPlainText('{"mode": "marks", "title": "Большой", "lang": "python", "marks": ['
+                               '{"from": 1, "to": 60, "step": 1, "say": "Первая половина"},'
+                               '{"from": 61, "to": 150, "step": 2, "say": "Вторая половина"}]}')
+    wait_for(lambda: d.add_btn.isEnabled(), 3)
+    check("разметка собрана в занятие: код целиком, 2 шага, замечаний нет",
+          "шагов: 2" in d.answer_info.text() and "Внимание" not in d.answer_info.text()
+          and d._ai_parsed.template.code_blocks()[0].text.count("\n") + 1 == L.BIG_LINES + 30 + 2,
+          d.answer_info.text()[:120])
+    d.close()
+    pump()
+
     # --- подключённая нейросеть (подставной сервер): «Разобрать нейросетью»
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Fake)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -190,8 +212,23 @@ def main() -> int:
           and "готово" in box.check_info.text(), f"{box.pill.text()} {box.check_info.text()[:60]}")
     box.combo.setCurrentIndex(box.combo.findData("claudeCli"))
     pump(0.1)
-    check("Claude по подписке: без адреса и ключа, модели haiku/sonnet/opus",
-          not box.row_key.isVisibleTo(sw) and box.model.count() == 3)
+    check("Claude по подписке: без адреса и ключа, список моделей с подписями, по умолчанию sonnet",
+          not box.row_key.isVisibleTo(sw) and box.model.count() == 4 and not box.model.isEditable()
+          and box.model.currentData() == "sonnet" and "Sonnet" in box.model.currentText())
+    box.combo.setCurrentIndex(box.combo.findData("codexCli"))
+    pump(0.1)
+    i = box.model.findData("gpt-5.6-terra")
+    box.model.setCurrentIndex(i)
+    pump(0.1)
+    check("ChatGPT по подписке (Codex): модель выбирается и сохраняется",
+          i >= 0 and s.ai_models.get("codexCli") == "gpt-5.6-terra" and box.model.itemText(0) == "Как в Codex",
+          repr(s.ai_models.get("codexCli")))
+    box.model.setCurrentIndex(0)
+    pump(0.1)
+    check("«Как в Codex» — модель не передаётся", s.ai_models.get("codexCli") == ""
+          and ai.config(s, "codexCli").model == "")
+    box.combo.setCurrentIndex(box.combo.findData("claudeCli"))
+    pump(0.1)
     sw.show_page("ai")
     pump(0.2)
     sw.grab().save(str(SHOTS / "settings-ai.png"))

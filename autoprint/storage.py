@@ -1,6 +1,9 @@
 """Хранилище: настройки (settings.json) и база образцов (templates.json).
 
-Обе лежат в папке data/ рядом с приложением — их легко забэкапить или перенести.
+Обе лежат в папке data/ рядом с приложением — их легко забэкапить или перенести. Кроме установки
+в Program Files (для всех пользователей): туда программа писать не может, и данные каждого пользователя —
+в %APPDATA%\\AutoPrintCode (туда же при первом запуске переносятся данные прежней установки «только для
+меня» из %LOCALAPPDATA%\\Programs\\AutoPrintCode\\data — см. migrate_legacy_data).
 """
 from __future__ import annotations
 
@@ -19,10 +22,81 @@ def app_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-# AUTOPRINT_DATA — другая папка данных (для тестов, чтобы не трогать рабочую базу)
-DATA_DIR = Path(os.environ.get("AUTOPRINT_DATA") or app_dir() / "data")
+APP_FOLDER = "AutoPrintCode"
+
+
+def _writable(d: Path) -> bool:
+    probe = d / f".write-test-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _in_program_files(d: Path) -> bool:
+    roots = [os.environ.get(k) for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432")]
+    p = os.path.normcase(str(d))
+    return any(r and p.startswith(os.path.normcase(r.rstrip("\\")) + "\\") for r in roots)
+
+
+def user_data_dir() -> Path:
+    """Папка данных пользователя для установки в Program Files."""
+    base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(base) / APP_FOLDER
+
+
+def _data_dir() -> Path:
+    # AUTOPRINT_DATA — другая папка данных (для тестов, чтобы не трогать рабочую базу)
+    if os.environ.get("AUTOPRINT_DATA"):
+        return Path(os.environ["AUTOPRINT_DATA"])
+    base = app_dir()
+    # собранная программа в Program Files (или в папке без права записи) — данные в профиле пользователя.
+    # Даже если её запустили «от администратора»: иначе данные разошлись бы по двум местам
+    if getattr(sys, "frozen", False) and (_in_program_files(base) or not _writable(base)):
+        return user_data_dir()
+    return base / "data"
+
+
+DATA_DIR = _data_dir()
 SETTINGS_FILE = DATA_DIR / "settings.json"
 TEMPLATES_FILE = DATA_DIR / "templates.json"
+
+
+def legacy_data_dir() -> Path:
+    """data/ прежней установки «только для меня» (до установки в Program Files)."""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / "Programs" / APP_FOLDER / "data"
+
+
+def migrate_legacy_data(target: Path = None, legacy: Path = None) -> bool:
+    """Первый запуск установки в Program Files: занятия, настройки и звуки прежней установки
+    «только для меня» переносятся в папку данных пользователя. True — перенесли."""
+    import logging
+    import shutil
+    target = target or DATA_DIR
+    legacy = legacy or legacy_data_dir()
+    if target == legacy or not legacy.is_dir():
+        return False
+    if (legacy.parent / f"{APP_FOLDER}.exe").exists():
+        return False     # прежняя копия ещё установлена и работает со своими данными — не забираем их
+    if (target / "settings.json").exists() or (target / "templates.json").exists():
+        return False     # здесь уже свои данные — не трогаем
+    if not ((legacy / "templates.json").exists() or (legacy / "settings.json").exists()):
+        return False
+    try:
+        shutil.copytree(legacy, target, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("updates", ".lock", "*.tmp"))
+    except OSError as e:
+        logging.getLogger("autoprint").warning("Данные прежней установки не перенесены: %s", e)
+        return False
+    try:   # перенесли — прежнюю копию убираем, чтобы не путаться (если удаление не выйдет, ничего страшного)
+        shutil.rmtree(legacy)
+        legacy.parent.rmdir()   # пустая папка прежней установки
+    except OSError:
+        pass
+    return True
 
 
 def _atomic_write(path: Path, data: dict, backup: bool = False) -> None:
@@ -79,6 +153,10 @@ class Settings:
 
     print_mode: str = "block"          # block — блок целиком | lines — по строкам | steps — по шагам
     show_prompter: bool = True         # суфлёр: что дальше и что сказать (комментарии шага)
+    prompter_window: bool = False      # суфлёр в отдельном окне (открыт)
+    prompter_mode: str = "auto"        # окно суфлёра: auto — печатает программа, self — набираю сам
+    prompter_font: int = 20            # окно суфлёра: размер текста «что сказать»
+    prompter_geometry: str = ""        # окно суфлёра: место и размер
     step_nav: str = "arrows"           # шаги: arrows — стрелками от курсора (код — продолжение файла)
                                        #       | home — от начала документа (Ctrl+Home)
 

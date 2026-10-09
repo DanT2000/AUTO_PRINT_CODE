@@ -11,6 +11,9 @@
   выхода программы, откладывает старые файлы, копирует новые (data\\ не трогает), при ошибке возвращает
   старые и запускает программу снова. Журнал скрипта — data/updates/apply.log.
   Если в релизе нет сборки, остаётся только ссылка на страницу релиза.
+- Собранная программа, установленная в Program Files (для всех пользователей), свою папку менять не может:
+  из релиза скачивается установщик AutoPrintCode-X.Y.Z-Setup.exe, сверяется с .sha256 и после выхода
+  запускается с запросом прав администратора (/SILENT /RELAUNCH=1 — поставит и запустит программу снова).
 
 Модуль без Qt: функции блокирующие, вызываются из фонового потока (см. ui/updates.py).
 """
@@ -37,7 +40,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import APP_NAME, __version__
-from .storage import DATA_DIR, app_dir
+from .storage import DATA_DIR, _in_program_files, app_dir
 
 log = logging.getLogger("autoprint.update")
 
@@ -68,6 +71,7 @@ _EXE_ZIP_RE = re.compile(rf"^{re.escape(APP_NAME)}-(.+)-win64\.zip$", re.IGNOREC
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{BC0222C7-A45D-4D77-A7C6-1EB7F2C4FB28}_is1"
 
 NO_BUILD_TEXT = "В этом выпуске нет готовой сборки для Windows — скачайте новую версию со страницы релиза."
+NO_SETUP_TEXT = "В этом выпуске нет установщика — скачайте новую версию со страницы релиза."
 NO_SHA_TEXT = ("В выпуске нет файла контрольной суммы (.sha256), поэтому установить его автоматически "
                "нельзя — скачайте новую версию со страницы релиза.")
 
@@ -240,6 +244,12 @@ class Release:
         """Установщик (необязателен): AutoPrintCode-0.5.0-Setup.exe."""
         return self.asset(f"{APP_NAME}-{self.version}-Setup.exe")
 
+    @property
+    def setup_sha(self) -> Asset | None:
+        """Контрольная сумма установщика: <установщик>.sha256."""
+        z = self.setup_exe
+        return self.asset(z.name + ".sha256") if z else None
+
 
 def _assets(r: dict) -> list[Asset]:
     out = []
@@ -365,7 +375,7 @@ def download_exe(rel: Release, progress: Callable[[int, int], None] | None = Non
     reason = release_block_reason(rel)
     if reason:
         raise UpdateError(reason)
-    z, sha = rel.exe_zip, rel.exe_sha
+    z, sha = (rel.setup_exe, rel.setup_sha) if via_installer() else (rel.exe_zip, rel.exe_sha)
     with _request(sha.url, accept="application/octet-stream") as r:
         expected = parse_sha256(r.read(4096).decode("utf-8", "replace"))
     if not expected:
@@ -454,7 +464,14 @@ def exe_version(path: Path) -> str:
 
 
 def stage_exe(zip_path: Path, rel: Release) -> Path:
-    """Распаковывает сборку во временную папку и проверяет: есть AutoPrintCode.exe и _internal, версия та."""
+    """Распаковывает сборку во временную папку и проверяет: есть AutoPrintCode.exe и _internal, версия та.
+    Установщик (…-Setup.exe) не распаковывается — только сверяется его версия."""
+    if zip_path.suffix.lower() == ".exe":
+        found = exe_version(zip_path)
+        key, want = parse_version(found) if found else None, parse_version(rel.version)
+        if key is not None and want is not None and key[:3] != want[:3]:
+            raise UpdateError(f"В релизе {rel.tag} лежит установщик версии {found} — обновление отменено.")
+        return zip_path
     # целостность уже проверена по SHA-256, повторно читать весь архив (testzip) незачем
     root = _extract(zip_path, UPDATES_DIR / f"staging-{rel.version}", test=False)
     if not (root / EXE_NAME).is_file() or not (root / INTERNAL_DIR).is_dir():
@@ -569,19 +586,47 @@ def _dir_writable(d: Path) -> bool:
         return False
 
 
+def _installed_for_all_users() -> bool:
+    """Программа поставлена установщиком для всех пользователей (запись в HKLM указывает на эту папку)."""
+    if sys.platform != "win32":
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0,
+                            winreg.KEY_QUERY_VALUE | winreg.KEY_WOW64_64KEY) as k:
+            where, _t = winreg.QueryValueEx(k, "InstallLocation")
+    except OSError:
+        return False
+    return os.path.normcase(os.path.normpath(str(where))) == os.path.normcase(str(app_dir()))
+
+
+def via_installer() -> bool:
+    """Обновлять установщиком (с правами администратора): сборка в Program Files, файлы менять самой нельзя."""
+    if not getattr(sys, "frozen", False):
+        return False
+    d = app_dir()
+    return (_in_program_files(d) or not _dir_writable(d)) and _installed_for_all_users()
+
+
 def frozen_layout_reason() -> str | None:
     """Почему собранная программа не может заменить свои файлы сама (None — может)."""
     d = app_dir()
     if Path(sys.executable).name.lower() != EXE_NAME.lower() or not (d / INTERNAL_DIR).is_dir():
         return "Эта сборка программы не умеет обновляться сама — скачайте новую версию со страницы релиза."
-    if not _dir_writable(d):
-        return ("Нет прав на запись в папку программы — скачайте новую версию со страницы релиза. "
-                "Установщик ставит программу в папку пользователя, там обновление работает само.")
+    if not _dir_writable(d) and not via_installer():
+        return ("Нет прав на запись в папку программы — скачайте новую версию со страницы релиза "
+                "и установите её.")
     return None
 
 
 def release_block_reason(rel: Release) -> str | None:
     """Почему этот релиз нельзя поставить в собранную программу автоматически (None — можно)."""
+    if via_installer():
+        if rel.setup_exe is None:
+            return NO_SETUP_TEXT
+        if rel.setup_sha is None:
+            return NO_SHA_TEXT
+        return None
     if rel.exe_zip is None:
         return NO_BUILD_TEXT
     if rel.exe_sha is None:
@@ -773,9 +818,15 @@ def prepare_exe_update(root: Path, new_version: str) -> Path:
     reason = frozen_layout_reason()
     if reason:
         raise UpdateError(reason)
-    if not (root / EXE_NAME).is_file() or not (root / INTERNAL_DIR).is_dir():
+    if root.suffix.lower() == ".exe":
+        # установщик: запустится после выхода с запросом прав администратора
+        if not root.is_file():
+            raise UpdateError("Скачанный установщик не найден — скачайте обновление заново.")
+        script = root
+    elif not (root / EXE_NAME).is_file() or not (root / INTERNAL_DIR).is_dir():
         raise UpdateError("Скачанное обновление не найдено или повреждено — скачайте его заново.")
-    script = write_update_helper(root, app_dir(), os.getpid(), new_version)
+    else:
+        script = write_update_helper(root, app_dir(), os.getpid(), new_version)
     _write_last_update({"from": __version__, "to": new_version, "time": time.time(), "shown": False,
                         "frozen": True})
     _pending_helper = script
@@ -799,10 +850,27 @@ def _run_pending_helper_at_exit() -> None:
         return
     script, _pending_helper = _pending_helper, None
     try:
-        run_update_helper(script, restart=False)
+        if script.suffix.lower() == ".exe":
+            run_setup(script, restart=False)
+        else:
+            run_update_helper(script, restart=False)
         log.info("Запущена установка обновления при выходе: %s", script)
     except OSError:
         log.exception("Не удалось запустить установку обновления")
+
+
+SETUP_ARGS = "/SILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS"
+
+
+def run_setup(setup: Path, restart: bool) -> None:
+    """Установщик — с запросом прав администратора (UAC). /SILENT — без вопросов, видно только ход
+    установки; /RELAUNCH=1 — установщик сам запустит программу (от имени пользователя, не администратора).
+    OSError — не запустился (например, отказались дать права)."""
+    import ctypes
+    args = SETUP_ARGS + (" /RELAUNCH=1" if restart else "")
+    r = ctypes.windll.shell32.ShellExecuteW(None, "runas", str(setup), args, str(setup.parent), 1)
+    if r <= 32:
+        raise OSError(f"установщик не запустился (код {r}; возможно, не дали права администратора)")
 
 
 def cleanup() -> None:
@@ -815,7 +883,7 @@ def cleanup() -> None:
     for p in UPDATES_DIR.iterdir():
         if p.name.startswith("staging-"):
             shutil.rmtree(p, ignore_errors=True)
-        elif p.suffix in (".zip", ".part"):
+        elif p.suffix in (".zip", ".part", ".exe"):   # .exe — скачанный установщик
             p.unlink(missing_ok=True)
         elif p == BACKUP_DIR:
             shutil.rmtree(p, ignore_errors=True)
@@ -871,7 +939,10 @@ def relaunch() -> None:
     if _pending_helper is not None:
         script, _pending_helper = _pending_helper, None
         try:
-            run_update_helper(script, restart=True)
+            if script.suffix.lower() == ".exe":
+                run_setup(script, restart=True)
+            else:
+                run_update_helper(script, restart=True)
             log.info("Перезапуск через установку обновления: %s", script)
             return
         except OSError as e:

@@ -71,6 +71,7 @@ class ControlStrip(QFrame):
     volume_released = Signal()
     profile_changed = Signal(str)
     mode_changed = Signal(str)
+    prompter_clicked = Signal()
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -88,6 +89,10 @@ class ControlStrip(QFrame):
         self.btn_restart.clicked.connect(self.restart_clicked)
         self.btn_stop = IconButton("stop", "Стоп", 15, box=36, framed=True)
         self.btn_stop.clicked.connect(self.stop_clicked)
+        self.btn_prompter = IconButton("lines", "Суфлёр в отдельном окне: что сказать и что набрать, "
+                                       "«Дальше» — следующий шаг", 15, box=36, framed=True)
+        self.btn_prompter.setCheckable(True)
+        self.btn_prompter.clicked.connect(self.prompter_clicked)
         self.speed = Segmented(SPEED_PRESETS)
         self.speed.setToolTip("Скорость печати")
         self.speed.changed.connect(self._on_preset)
@@ -104,8 +109,8 @@ class ControlStrip(QFrame):
         self.mode.setToolTip("Целиком — блок за один раз · По строкам — строка, затем Enter — следующая · "
                              "По шагам — урок частями, в том числе с возвратом наверх")
         self.mode.changed.connect(lambda k: self.mode_changed.emit(str(k)))
-        for w in (self.btn_toggle, self.btn_restart, self.btn_stop, flow_sep(), self.mode, flow_sep(),
-                  self.speed, self.cpm, flow_sep(), self.sw_human, self.sw_strip):
+        for w in (self.btn_toggle, self.btn_restart, self.btn_stop, self.btn_prompter, flow_sep(), self.mode,
+                  flow_sep(), self.speed, self.cpm, flow_sep(), self.sw_human, self.sw_strip):
             flow.addWidget(w)
         outer.addWidget(top)
 
@@ -195,6 +200,10 @@ class ControlStrip(QFrame):
             self.btn_toggle.set_mode("Дальше", "enter")
         else:
             self.btn_toggle.set_mode("Старт", "play")
+
+    def set_prompter_on(self, on: bool) -> None:
+        self.btn_prompter.setChecked(on)
+        self.btn_prompter.set_icon("lines", "accent" if on else "dim")
 
     def set_info(self, html: str) -> None:
         self.info.setText(html)

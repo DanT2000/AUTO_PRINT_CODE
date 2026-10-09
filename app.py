@@ -12,7 +12,7 @@ from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from autoprint import APP_NAME
-from autoprint.storage import DATA_DIR, Settings, TemplateStore
+from autoprint.storage import DATA_DIR, Settings, TemplateStore, migrate_legacy_data, user_data_dir
 
 
 def main() -> int:
@@ -59,6 +59,9 @@ def main() -> int:
         QMessageBox.information(None, APP_NAME, "AutoPrintCode уже запущен (ищите значок в трее).")
         return 0
 
+    # установка в Program Files: данные — в профиле; первый запуск переносит их из прежней установки
+    migrated = DATA_DIR == user_data_dir() and migrate_legacy_data()
+
     from autoprint.logs import setup_logging
     crash_box_open = False
 
@@ -86,6 +89,8 @@ def main() -> int:
             crash_box_open = False
 
     setup_logging(on_crash=on_crash)
+    if migrated:
+        logging.getLogger("autoprint").info("Данные прежней установки перенесены в %s", DATA_DIR)
 
     try:
         store = TemplateStore()

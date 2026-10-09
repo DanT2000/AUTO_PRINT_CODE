@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -265,6 +266,70 @@ def test_manager() -> None:
         updater.frozen_layout_reason = real
 
 
+def test_program_files() -> None:
+    """Установка в Program Files: обновление — установщиком (Setup.exe + .sha256), данные — в профиле."""
+    import contextlib
+    import io
+    from autoprint import storage
+    real = updater.via_installer
+    updater.via_installer = lambda: True
+    real_request, real_fetch = updater._request, updater._fetch
+    try:
+        setup = Asset("AutoPrintCode-0.5.0-Setup.exe", "https://x/setup.exe", 7)
+        sha = Asset("AutoPrintCode-0.5.0-Setup.exe.sha256", "https://x/setup.sha")
+        zip_only = [Asset("AutoPrintCode-0.5.0-win64.zip", "https://x/a.zip"),
+                    Asset("AutoPrintCode-0.5.0-win64.zip.sha256", "https://x/a.sha")]
+        rel = Release("0.5.0", "v0.5.0", "n", "", "page", "zip", "", assets=zip_only + [setup, sha])
+        check("Program Files: релиз с установщиком и .sha256 — можно ставить", updater.release_block_reason(rel) is None)
+        check("Program Files: без установщика — только страница релиза",
+              updater.release_block_reason(Release("0.5.0", "v0.5.0", "n", "", "p", "z", "", assets=zip_only))
+              == updater.NO_SETUP_TEXT)
+        check("Program Files: установщик без .sha256 — не ставится",
+              updater.release_block_reason(Release("0.5.0", "v0.5.0", "n", "", "p", "z", "", assets=[setup]))
+              == updater.NO_SHA_TEXT)
+        body = b"MZsetup"
+        good = hashlib.sha256(body).hexdigest()
+        updater._request = lambda url, **kw: contextlib.nullcontext(io.BytesIO(f"{good}  x\n".encode()))
+
+        def fake_fetch(url, dest, progress, cancelled, accept="", size=0):
+            check("Program Files: скачивается установщик, а не архив", url == setup.url, url)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(body)
+            return dest
+        updater._fetch = fake_fetch
+        got = updater.download_exe(rel)
+        check("Program Files: установщик скачан и сверен по SHA-256", got.name == setup.name and got.read_bytes() == body)
+        check("Program Files: установщик не распаковывается", updater.stage_exe(got, rel) == got)
+        wrong = got.with_name("other-Setup.exe")
+        wrong.write_bytes(Path(sys.executable).read_bytes())
+        err = error_of(updater.stage_exe, wrong, rel)
+        check("Program Files: установщик другой версии — отказ", err is not None and "версии" in err, str(err))
+    finally:
+        updater.via_installer = real
+        updater._request, updater._fetch = real_request, real_fetch
+
+    pf = os.environ.get("ProgramFiles", r"C:\Program Files")
+    check("папка в Program Files распознаётся", storage._in_program_files(Path(pf) / "AutoPrintCode")
+          and not storage._in_program_files(Path(pf + "X") / "AutoPrintCode")
+          and not storage._in_program_files(TMP))
+    # перенос данных прежней установки «только для меня»
+    old = TMP / "pf" / "Local" / "Programs" / "AutoPrintCode" / "data"
+    write_tree(old, {"settings.json": b'{"cpm": 500}', "templates.json": b'{"templates": []}',
+                     "sounds/a.wav": b"RIFF", "updates/junk.zip": b"z"})
+    new = TMP / "pf" / "Roaming" / "AutoPrintCode"
+    (old.parent / "AutoPrintCode.exe").write_bytes(b"MZ")
+    check("прежняя копия ещё установлена — её данные не забираем", not storage.migrate_legacy_data(new, old)
+          and not new.exists() and (old / "settings.json").exists())
+    (old.parent / "AutoPrintCode.exe").unlink()   # прежнюю копию удалили — данные «осиротели»
+    moved = storage.migrate_legacy_data(new, old)
+    check("данные прежней установки перенесены (без updates), старая папка убрана",
+          moved and (new / "settings.json").read_bytes() == b'{"cpm": 500}' and (new / "sounds" / "a.wav").is_file()
+          and not (new / "updates").exists() and not old.exists() and not old.parent.exists())
+    write_tree(old, {"settings.json": b'{"cpm": 1}'})
+    check("свои данные уже есть — перенос не трогает их", not storage.migrate_legacy_data(new, old)
+          and (new / "settings.json").read_bytes() == b'{"cpm": 500}' and old.exists())
+
+
 # ---------------------------------------------------------------- скрипт установки сборки
 
 OLD_APP = {"AutoPrintCode.exe": b"old exe 0.4.0", "_internal/old.dll": b"old dll",
@@ -392,7 +457,7 @@ def test_helper_run() -> None:
 def main() -> int:
     check("данные теста — во временной папке", str(updater.UPDATES_DIR).startswith(str(TMP)))
     for t in (test_releases, test_sha, test_stage_exe, test_guards, test_last_update, test_manager,
-              test_helper_text, test_helper_run):
+              test_program_files, test_helper_text, test_helper_run):
         try:
             t()
         except Exception as e:   # упавший тест не должен скрыть остальные

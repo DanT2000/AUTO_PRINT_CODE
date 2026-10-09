@@ -1,6 +1,6 @@
 """Сквозная проверка нового интерфейса: главное окно готовит текст активного блока и печатает его в Блокнот.
 
-    python tests/ui_print.py
+    python tests/ui_print.py [block steps lines prompter vscode]
 
 Печать запускается так же, как по хоткею (cmd_toggle). Проверяются оба профиля и режим «Без комментариев»
 (в нём ход печати сопоставляется с исходным блоком по карте позиций). Во время прогона НЕ трогать
@@ -170,6 +170,79 @@ def run_steps(win: MainWindow, name: str, profile: str, cmd: list[str], settle: 
     return ok and done and win.engine.state in (FINISHED, IDLE)
 
 
+def click(widget) -> None:
+    """Настоящий щелчок мышью по середине виджета (курсор ставит Qt — с учётом масштаба экрана)."""
+    from PySide6.QtGui import QCursor
+    QCursor.setPos(widget.mapToGlobal(widget.rect().center()))
+    time.sleep(0.15)
+    _u.mouse_event(0x0002, 0, 0, 0, 0)   # LEFTDOWN
+    time.sleep(0.05)
+    _u.mouse_event(0x0004, 0, 0, 0, 0)   # LEFTUP
+
+
+def run_prompter(win: MainWindow, name: str) -> bool:
+    """Окно суфлёра вживую: щелчок по «Дальше» печатает шаг в Блокнот — фокус остаётся в Блокноте
+    (окно суфлёра не активируется); «Печатаю сам» — щелчки листают шаги и ничего не печатают."""
+    s = win.settings
+    s.profile, s.strip_comments = "plain", True
+    t = next(t for t in win.store.templates if t.title.startswith("Пример: пошаговый"))
+    win.open_template(t.id)
+    block = t.code_blocks()[0]
+    win.current_view().arm(block.id)
+    win._on_mode("steps")
+    win._apply_settings()
+    win.step_next.pop(block.id, None)
+    ctl = win.prompter_ctl
+    ctl.show()
+    pump(0.5)
+    pw = ctl.window
+    from autoprint.ui.frameless import user32
+    ex = user32.GetWindowLongPtrW(int(pw.winId()), -20)
+    noact = bool(ex & 0x08000000)
+    path = os.path.join(SP, f"{name}.txt")
+    open(path, "w", encoding="utf-8").write("")
+    if not open_editor(["notepad.exe"], path, 1.5):
+        return False
+    n_steps = len(win._block_steps(block))
+    focus_kept = True
+    for i in range(n_steps):
+        click(pw.btn_next)
+        from autoprint.typer import COUNTDOWN, RUNNING
+        started = wait_state(win, (RUNNING, COUNTDOWN), 10)   # сначала — началась печать этого шага
+        if not started or not wait_state(win, (FINISHED,)):
+            print(f"[{name}] шаг {i + 1} не напечатан, состояние {win.engine.state}")
+            return False
+        pump(0.4)
+        focus_kept = focus_kept and f"{name}.txt" in w.window_title(w.foreground_window())
+    expected = strip_comments(block.text, block.lang)[0]
+    w.tap(ord("S"), w.VK_CONTROL)
+    time.sleep(1.2)
+    got = open(path, encoding="utf-8-sig").read().replace("\r\n", "\n")
+    ok = got.rstrip("\n") == expected.rstrip("\n")
+    # «Печатаю сам»: щелчки листают шаги, в Блокнот ничего не попадает
+    click(pw.mode.buttons["self"])
+    pump(0.3)
+    before = ctl.card().title
+    click(pw.btn_next)
+    pump(0.5)
+    after = ctl.card().title
+    w.tap(ord("S"), w.VK_CONTROL)
+    time.sleep(0.8)
+    same = open(path, encoding="utf-8-sig").read().replace("\r\n", "\n") == got
+    print(f"[{name}] окно не активируется: {noact} · шагов {n_steps} щелчками · {'MATCH' if ok else 'DIFF'} · "
+          f"фокус остался в Блокноте: {focus_kept} · «печатаю сам»: «{before}» → «{after}», "
+          f"в Блокноте без изменений: {same}")
+    if not ok:
+        print("  GOT:", repr(got))
+        print("  EXP:", repr(expected))
+    w.tap(ord("W"), w.VK_CONTROL)
+    pump(1.0)
+    pw.mode_changed.emit("auto")
+    pw.close()
+    win._on_mode("block")
+    return ok and noact and focus_kept and before != after and same
+
+
 def run_lines(win: MainWindow, name: str, profile: str) -> bool:
     """По строкам: после каждой строки ждём; «Enter пользователя» и хоткей — по очереди."""
     from autoprint.typer import LINE_WAIT
@@ -240,6 +313,8 @@ def main() -> int:
                     run_steps(win, "ui_steps_ide", "ide", ["notepad.exe"])]
     if "lines" in which:
         results += [run_lines(win, "ui_lines_plain", "plain"), run_lines(win, "ui_lines_ide", "ide")]
+    if "prompter" in which:
+        results.append(run_prompter(win, "ui_prompter"))
     if "vscode" in which:
         if VSCODE.exists():
             cmd = [str(VSCODE), f"--user-data-dir={SP}/vscode-data", f"--extensions-dir={SP}/vscode-ext",

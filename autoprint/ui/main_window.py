@@ -26,6 +26,7 @@ from .control_strip import STATE_TEXT, ControlStrip
 from .frameless import FramelessWindow
 from .library import ROLE_COUNT, ROLE_ID, LibraryPanel
 from .prompter import Prompter
+from .prompter_control import PrompterController
 from .settings_window import HOTKEYS, SettingsWindow
 from .template_view import TemplateView, ZoomWheelFilter, _plural
 from .theme import STATE_TOKENS, theme
@@ -197,7 +198,10 @@ class MainWindow(FramelessWindow):
         strip_wrap.setSpacing(10)
         strip_wrap.addWidget(self.strip)
         self.prompter = Prompter()
+        self.prompter.detach_clicked.connect(lambda: self.prompter_ctl.show())
         strip_wrap.addWidget(self.prompter)
+        self.prompter_ctl = PrompterController(self)    # суфлёр в отдельном окне
+        self.strip.prompter_clicked.connect(lambda: self.prompter_ctl.toggle())
         ml.addLayout(strip_wrap)
         self.stack = QStackedWidget()
         ml.addWidget(self.stack, 1)
@@ -234,6 +238,8 @@ class MainWindow(FramelessWindow):
         m.addSeparator()
         m.addAction(icons.icon("file-code"), "Добавить пример занятия (все возможности)", self._add_tour_sample)
         m.addAction(icons.icon("file-code"), "Добавить пример пошагового урока", self._add_steps_sample)
+        m.addAction(icons.icon("external"), ("Закрыть окно суфлёра" if self.prompter_ctl.visible()
+                                             else "Суфлёр в отдельном окне"), lambda: self.prompter_ctl.toggle())
         m.addAction(icons.icon("lines"), "Все блоки — обычный размер\tCtrl+Shift+0", self._reset_zoom)
         m.addAction(icons.icon("bug"), "Сообщить об ошибке…", self.open_report)
         m.addAction(icons.icon("file-text"), "Журнал работы", self._open_log)
@@ -249,6 +255,7 @@ class MainWindow(FramelessWindow):
         menu.addAction("Старт / пауза", lambda: self.cmd_toggle(from_button=False, countdown=3, pressed=True))
         menu.aboutToShow.connect(self._remember_press)
         menu.addAction("Стоп", self.cmd_stop)
+        menu.addAction("Суфлёр в отдельном окне", lambda: self.prompter_ctl.toggle())
         menu.addSeparator()
         self.tray_update = menu.addAction("Обновление…", self.open_update_dialog)
         self.tray_update.setVisible(False)
@@ -795,6 +802,8 @@ class MainWindow(FramelessWindow):
         if tid:
             self.open_template(tid)
         self._update_armed_label()
+        if s.prompter_window:
+            QTimer.singleShot(300, self.prompter_ctl.show)   # в прошлый раз суфлёр был открыт отдельным окном
 
     def _save_session(self) -> None:
         s = self.settings
@@ -958,8 +967,13 @@ class MainWindow(FramelessWindow):
         self._refresh_prompter()
 
     def _refresh_prompter(self) -> None:
-        """Суфлёр: что дальше и что сказать. Только для «По строкам» и «По шагам»."""
+        """Суфлёр: что дальше и что сказать. Только для «По строкам» и «По шагам».
+        Открыто окно суфлёра — показывает оно, а суфлёр под пультом прячется."""
         s = self.settings
+        if self.prompter_ctl.visible():
+            self.prompter.hide()
+            self.prompter_ctl.refresh()
+            return
         a = self._armed()
         if not s.show_prompter or s.print_mode == MODE_BLOCK or not a:
             self.prompter.hide()
@@ -981,19 +995,34 @@ class MainWindow(FramelessWindow):
             self.prompter.show_content(f"{head}: шаг {i} из {n} · {name}",
                                        "" if busy else f"{s.hotkey_toggle} — напечатать шаг", say, code, hidden)
             return
-        # по строкам: следующая непустая строка и комментарии перед ней
-        job = self.job if busy and self.job.get("kind") == MODE_LINES else self._job_for_armed()
-        if not job or job.get("kind") != MODE_LINES:
+        info = self._lines_prompt(block)
+        if info is None:
             self.prompter.hide()
             return
+        title, say, row = info
+        if not row:
+            self.prompter.show_content(f"{name} · строки кончились", "", [], [])
+            return
+        hint = "" if busy else f"{s.hotkey_toggle} — начать"
+        if busy and self.engine.state == LINE_WAIT:
+            hint = f"Enter или {s.hotkey_toggle} — напечатать"
+        self.prompter.show_content(f"Дальше: {title} · {name}", hint, say, [row])
+
+    def _lines_prompt(self, block: Block) -> tuple[str, list[str], str] | None:
+        """По строкам: следующая непустая строка и комментарии перед ней → («строка N из M», что сказать,
+        строка; "" — строки кончились). None — печатать нечего."""
+        s = self.settings
+        busy = self.engine.state in BUSY and self.job and self.job["bid"] == block.id
+        job = self.job if busy and self.job.get("kind") == MODE_LINES else self._job_for_armed()
+        if not job or job.get("kind") != MODE_LINES:
+            return None
         text = job["text"]
         rows = text.split("\n")
         pos = getattr(self, "_last_pos", 0) if busy else 0
         cur = text.count("\n", 0, pos) if busy and pos else -1
         nxt = next((r for r in range(cur + 1, len(rows)) if rows[r].strip()), None)
         if nxt is None:
-            self.prompter.show_content(f"{name} · строки кончились", "", [], [])
-            return
+            return f"{len(rows)} из {len(rows)}", [], ""
         starts = [0]
         for r in rows[:-1]:
             starts.append(starts[-1] + len(r) + 1)
@@ -1021,11 +1050,7 @@ class MainWindow(FramelessWindow):
         b_end = line_end(row_start(nxt))
         say = [comment_text(block.text[x:y]) for x, y in comment_spans(block.text, block.lang)
                if a_src <= x < b_end] if s.strip_comments else []
-        hint = "" if busy else f"{s.hotkey_toggle} — начать"
-        if busy and self.engine.state == LINE_WAIT:
-            hint = f"Enter или {s.hotkey_toggle} — напечатать"
-        self.prompter.show_content(f"Дальше: строка {nxt + 1} из {len(rows)} · {name}", hint,
-                                   [t for t in say if t], [rows[nxt]])
+        return f"строка {nxt + 1} из {len(rows)}", [t for t in say if t], rows[nxt]
 
     # ---- задание на печать
     def _job_for_armed(self) -> dict | None:
@@ -1201,6 +1226,8 @@ class MainWindow(FramelessWindow):
             self._notify(f"Занятие: {v.template.title}", tray=True)
 
     def _on_hotkey(self, action: str) -> None:
+        if self.prompter_ctl.on_hotkey(action):
+            return   # суфлёр «печатаю сам»: хоткеи листают шаги, программа не печатает
         if action == "hotkey_toggle":
             self.cmd_toggle()
         elif action == "hotkey_restart":
@@ -1257,6 +1284,7 @@ class MainWindow(FramelessWindow):
             self._show_job_progress()
             self._refresh_prompter()
         self._set_title_status()
+        self.prompter_ctl.refresh()
 
     def _set_title_status(self, extra: str = "") -> None:
         st = self.engine.state
@@ -1345,6 +1373,8 @@ class MainWindow(FramelessWindow):
                          f"Все {n} {_plural(n, 'шаг', 'шага', 'шагов')} напечатаны.", quiet=True)
         else:
             self._notify("Набор завершён.", quiet=True)
+        if job and self.prompter_ctl.after_block_done():
+            return   # открыт суфлёр — он сам ведёт к следующему блоку занятия
         if self.settings.auto_advance and job:
             v = self.views.get(job["tid"])
             if v and v is self.current_view():
@@ -1503,6 +1533,7 @@ class MainWindow(FramelessWindow):
                 log.warning("Обновление при выходе не установлено: %s", err)
         if self.settings_win:
             self.settings_win.close()
+        self.prompter_ctl.shutdown()
         self.engine.stop()
         self._save_timer.stop()
         self._save_store()
